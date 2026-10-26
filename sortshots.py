@@ -608,6 +608,9 @@ def cmd_app(_):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # консоль Windows не в UTF-8: без этого кириллица роняет print
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("pull").set_defaults(f=cmd_pull)

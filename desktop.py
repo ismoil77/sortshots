@@ -14,6 +14,9 @@ TITLE = "Разбор скриншотов"
 if sys.stdout is None:  # .exe без консоли: print и traceback иначе падают, пишем в лог
     S.APP_DATA.mkdir(parents=True, exist_ok=True)
     sys.stdout = sys.stderr = open(S.APP_DATA / "app.log", "a", encoding="utf-8", buffering=1)
+for stream in (sys.stdout, sys.stderr):  # консоль Windows в cp1252/cp866: кириллица роняла print
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def wait_up(url, seconds=15):
