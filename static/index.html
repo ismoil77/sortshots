@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Разбор скриншотов</title>
+<link rel="icon" href="/static/icon.png">
+<link rel="stylesheet" href="/static/pico.min.css">
+<script defer src="/static/alpine.min.js"></script>
+<style>
+  :root { --pico-font-size: 15px; --ok: #16a34a; --warn: #d97706; }
+  body { padding-bottom: 2rem; }
+  header.top { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem 1rem; padding: 1rem 0 .5rem; }
+  header.top h1 { margin: 0; font-size: 1.35rem; }
+  header.top .btns { display: flex; flex-wrap: wrap; gap: .5rem; margin-left: auto; }
+  header.top button { margin: 0; padding: .45rem .9rem; font-size: .9rem; width: auto; }
+  .pill { display: inline-block; padding: .15rem .6rem; border-radius: 99px; font-size: .8rem;
+          background: var(--pico-muted-border-color); }
+  .pill.live { background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
+  .layout { display: grid; gap: 1rem; grid-template-columns: 1fr; }
+  @media (min-width: 1000px) { .layout { grid-template-columns: minmax(0, 1fr) 360px; } }
+  article { margin: 0 0 1rem; padding: 1rem 1.1rem; }
+  article h3 { font-size: 1rem; margin-bottom: .6rem; }
+  .big { font-size: 1.9rem; font-weight: 700; line-height: 1.1; }
+  .muted { color: var(--pico-muted-color); font-size: .85rem; }
+  .stats { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; margin-top: .4rem; }
+  progress { margin-bottom: .3rem; }
+  .now { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .75rem; }
+  .now figure { margin: 0; position: relative; }
+  .now img { width: 100%; height: 210px; object-fit: cover; object-position: top; border-radius: 8px; }
+  .now figcaption { font-size: .78rem; word-break: break-all; }
+  .scan { position: absolute; left: 0; right: 0; top: 0; height: 210px; border-radius: 8px; overflow: hidden; pointer-events: none; }
+  .scan::after { content: ""; position: absolute; left: 0; right: 0; height: 30%;
+                 background: linear-gradient(transparent, color-mix(in srgb, var(--pico-primary) 45%, transparent));
+                 animation: scan 1.6s linear infinite; }
+  @keyframes scan { from { top: -30%; } to { top: 100%; } }
+  @media (prefers-reduced-motion: reduce) { .scan::after { animation: none; display: none; } }
+  .feed { display: flex; flex-direction: column; gap: .5rem; max-height: 560px; overflow: auto; }
+  .row { display: grid; grid-template-columns: 44px 1fr auto; gap: .7rem; align-items: center; cursor: pointer;
+         padding: .3rem; border-radius: 8px; }
+  .row:hover { background: var(--pico-muted-border-color); }
+  .row img { width: 44px; height: 64px; object-fit: cover; object-position: top; border-radius: 5px; }
+  .row .t { font-weight: 600; font-size: .9rem; }
+  .chip { display: inline-block; font-size: .75rem; padding: .05rem .5rem; border-radius: 6px;
+          border: 1px solid var(--pico-muted-border-color); white-space: nowrap; }
+  .chip.check { border-color: var(--warn); color: var(--warn); }
+  .conf { font-variant-numeric: tabular-nums; font-size: .8rem; }
+  .tree ul { list-style: none; padding: 0; margin: 0; }
+  .tree li { list-style: none; margin: 0; }
+  .node { display: grid; grid-template-columns: 1fr auto; gap: .5rem; padding: .3rem .4rem; border-radius: 6px; cursor: pointer; font-size: .9rem; }
+  .node:hover { background: var(--pico-muted-border-color); }
+  .node .bar { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: var(--pico-primary-background); opacity: .7; }
+  .node.sub { padding-left: 1.4rem; }
+  .node b { font-variant-numeric: tabular-nums; }
+  .node.warn { color: var(--warn); }
+  .node.empty { opacity: .45; }
+  .node.bump { animation: bump 1.2s ease-out; }
+  @keyframes bump { from { background: color-mix(in srgb, var(--pico-primary) 30%, transparent); } to { background: transparent; } }
+  @media (prefers-reduced-motion: reduce) { .node.bump { animation: none; } }
+  .model { margin-bottom: .6rem; font-size: .9rem; }
+  .err { font-size: .8rem; color: #dc2626; word-break: break-word; }
+  dialog article { width: min(1200px, 96vw); max-width: none; max-height: 92vh; overflow: auto; }
+  .grid-files { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; }
+  .card { display: flex; flex-direction: column; gap: .35rem; font-size: .85rem; }
+  .card img { width: 100%; height: 300px; object-fit: cover; object-position: top; border-radius: 8px; cursor: zoom-in; }
+  .card select { margin: 0; padding: .3rem .5rem; font-size: .82rem; }
+  .card.moved { opacity: .45; }
+  .zoom img { max-width: 94vw; max-height: 90vh; }
+  textarea.topics { min-height: 340px; font-family: ui-monospace, monospace; font-size: .85rem; }
+</style>
+</head>
+<body>
+<main class="container-fluid" x-data="app()" x-init="init()">
+
+  <header class="top">
+    <h1>Разбор скриншотов</h1>
+    <span class="pill" :class="s.running && !s.paused && 'live'" x-text="phaseLabel()"></span>
+    <div class="btns">
+      <button class="secondary" @click="post('/api/import')" :disabled="s.running">Выбрать папку</button>
+      <button class="secondary" @click="post('/api/start', {phone: true})" :disabled="s.running"
+              title="Нужен кабель и включённая «Отладка по USB» на телефоне">С телефона по USB</button>
+      <button @click="post('/api/start')" x-show="!s.running" x-text="s.fast_done ? 'Продолжить разбор' : 'Начать разбор'"></button>
+      <button class="secondary" @click="post('/api/pause')" x-show="s.running && !s.paused">Пауза</button>
+      <button @click="post('/api/resume')" x-show="s.running && s.paused">Продолжить</button>
+      <button class="secondary outline" @click="post('/api/stop')" x-show="s.running">Стоп</button>
+      <button class="secondary outline" @click="openTopics()" :disabled="s.running">Темы</button>
+    </div>
+  </header>
+  <div style="display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;align-items:center">
+    <p class="muted" style="margin:0" x-text="s.msg" x-show="s.msg"></p>
+    <label style="margin:0 0 0 auto;font-size:.9rem" title="Сильная модель перепроверяет разработку и спорные скриншоты: точнее названия, но около 40 секунд на скриншот">
+      <input type="checkbox" role="switch" :checked="s.settings && s.settings.strong" @change="post('/api/settings', {strong: $event.target.checked})">
+      Перепроверка сильной моделью (точнее, но медленно)
+    </label>
+  </div>
+
+  <div class="layout">
+    <section>
+      <article x-show="!s.total && !s.running">
+        <h3>С чего начать</h3>
+        <ol>
+          <li x-show="s.setup.ollama !== 'готова'">Установи Ollama: справа, в карточке «Модели». Она запускает нейросеть прямо на этом компьютере.</li>
+          <li>Нажми «Выбрать папку» и укажи папку со скриншотами. Оригиналы останутся на месте, приложение работает с копиями.</li>
+          <li>Или подключи телефон кабелем и нажми «С телефона по USB»: скопируется только папка Screenshots.</li>
+        </ol>
+        <p class="muted" x-text="'Разобранные скриншоты появятся в ' + s.root"></p>
+      </article>
+      <article>
+        <h3>Прогресс</h3>
+        <div class="big"><span x-text="s.fast_done"></span> <span class="muted">из</span> <span x-text="s.total"></span></div>
+        <progress value="0" :value="s.fast_done" :max="s.total || 1"></progress>
+        <div class="stats">
+          <span>Осталось примерно: <b x-text="eta()"></b></span>
+          <span>Скорость: <b x-text="speed()"></b></span>
+          <span>Перепроверено: <b x-text="s.strong_done + ' из ' + s.strong_need"></b></span>
+        </div>
+        <template x-if="s.strong_need">
+          <div style="margin-top:.6rem">
+            <span class="muted">Перепроверка сильной моделью (разработка и спорные)</span>
+            <progress value="0" :value="s.strong_done" :max="s.strong_need"></progress>
+          </div>
+        </template>
+        <template x-if="s.phase === 'phone' && s.phone.total">
+          <div style="margin-top:.6rem">
+            <span class="muted" x-text="'Копирую: ' + s.phone.copied + ' из ' + s.phone.total"></span>
+            <progress value="0" :value="s.phone.copied" :max="s.phone.total"></progress>
+          </div>
+        </template>
+      </article>
+
+      <article x-show="s.current.length">
+        <h3>Сейчас разбирает</h3>
+        <div class="now">
+          <template x-for="c in s.current" :key="c.sha">
+            <figure>
+              <img :src="'/img/' + c.sha + '?w=320'" alt="">
+              <div class="scan"></div>
+              <figcaption>
+                <div x-text="c.name"></div>
+                <div class="muted" x-text="stageName(c.stage) + ' · ' + c.secs + ' с'"></div>
+              </figcaption>
+            </figure>
+          </template>
+        </div>
+      </article>
+
+      <article>
+        <h3>Только что разобраны</h3>
+        <p class="muted" x-show="!s.recent.length">Здесь появятся скриншоты: название, папка и уверенность модели.</p>
+        <div class="feed">
+          <template x-for="r in s.recent" :key="r.sha + r.stage">
+            <div class="row" @click="openFolder(r.topic)">
+              <img :src="'/img/' + r.sha + '?w=120'" alt="" loading="lazy">
+              <div>
+                <div class="t" x-text="r.title"></div>
+                <div>
+                  <span class="chip" :class="r.topic === 'Проверить' && 'check'" x-text="r.topic"></span>
+                  <span class="muted" x-text="r.stage === 'strong' ? ' перепроверен' : ''"></span>
+                </div>
+              </div>
+              <div class="conf" :title="'уверенность модели'" x-text="Math.round(r.conf * 100) + '%'"></div>
+            </div>
+          </template>
+        </div>
+      </article>
+    </section>
+
+    <aside>
+      <article class="tree">
+        <h3>Папки <span class="muted" x-text="'· ' + placedCount() + ' файлов разложено'"></span></h3>
+        <ul>
+          <template x-for="g in tree()" :key="g.name">
+            <li>
+              <div class="node" :class="[g.name === 'Проверить' && 'warn', !g.count && 'empty', bumped(g.name) && 'bump']" @click="g.children.length ? null : openFolder(g.name)">
+                <span x-text="(g.children.length ? '▾ ' : '') + g.name"></span><b x-text="g.count"></b>
+                <span class="bar" :style="'width:' + bar(g.count) + '%'"></span>
+              </div>
+              <ul>
+                <template x-for="c in g.children" :key="c.path">
+                  <li>
+                    <div class="node sub" :class="[!c.count && 'empty', bumped(c.path) && 'bump']" @click="openFolder(c.path)">
+                      <span x-text="c.name"></span><b x-text="c.count"></b>
+                      <span class="bar" :style="'width:' + bar(c.count) + '%'"></span>
+                    </div>
+                  </li>
+                </template>
+              </ul>
+            </li>
+          </template>
+        </ul>
+        <button class="secondary outline" style="margin-top:.8rem;width:100%" @click="post('/api/open', {path: ''})">Открыть папку в файлах</button>
+      </article>
+
+      <article>
+        <h3>Модели</h3>
+        <div class="model" x-show="s.setup.ollama !== 'готова'">
+          <div>Ollama · <span class="muted" x-text="ollamaLabel()"></span></div>
+          <progress x-show="s.setup.ollama === 'качается'" value="0" :value="s.setup.pct" max="100"></progress>
+          <div class="err" x-show="s.setup.error" x-text="s.setup.error"></div>
+          <button x-show="s.windows && ['нет', 'ошибка'].includes(s.setup.ollama)" @click="post('/api/install-ollama')"
+                  style="width:100%;margin-top:.4rem">Установить Ollama (≈ 1 ГБ)</button>
+          <p class="muted" x-show="!s.windows && s.setup.ollama === 'нет'">
+            Установи Ollama с ollama.com/download и перезапусти приложение.</p>
+        </div>
+        <template x-for="(m, name) in s.models" :key="name">
+          <div class="model">
+            <div><span x-text="modelName(name)"></span> · <span class="muted" x-text="m.status + (m.status === 'качается' ? ' ' + m.pct + '%' + (m.gb ? ' из ' + m.gb + ' ГБ' : '') : '')"></span></div>
+            <progress x-show="m.status === 'качается'" :value="m.pct" max="100"></progress>
+            <button class="secondary outline" x-show="['нет', 'ошибка'].includes(m.status)" @click="post('/api/pull', {model: name})"
+                    style="width:100%;margin-top:.3rem;padding:.3rem" x-text="name.includes(':8b') ? 'Скачать (≈ 6 ГБ)' : 'Скачать (≈ 3,3 ГБ)'"></button>
+          </div>
+        </template>
+        <p class="muted">Нейросеть работает на этом компьютере: скриншоты никуда не отправляются.</p>
+      </article>
+
+      <article x-show="s.errors.length">
+        <h3>Ошибки</h3>
+        <template x-for="e in s.errors.slice(0, 8)"><div class="err" x-text="e"></div></template>
+      </article>
+    </aside>
+  </div>
+
+  <dialog :open="folder.open" @keydown.escape.window="folder.open = false">
+    <article>
+      <header style="display:flex;align-items:center;gap:1rem">
+        <strong x-text="folder.path + ' · ' + folder.items.length"></strong>
+        <button class="secondary outline" style="margin:0 0 0 auto;width:auto;padding:.3rem .8rem" @click="post('/api/open', {path: folder.path})">Открыть в файлах</button>
+        <button class="secondary" style="margin:0;width:auto;padding:.3rem .8rem" @click="folder.open = false">Закрыть</button>
+      </header>
+      <p class="muted">Если скриншот лежит не там, выбери правильную папку в списке под ним: файл переедет сразу.</p>
+      <div class="grid-files">
+        <template x-for="f in folder.items" :key="f.sha">
+          <div class="card" :class="f.moved && 'moved'">
+            <img :src="'/img/' + f.sha + '?w=400'" alt="" loading="lazy" @click="zoom = f.sha">
+            <strong x-text="f.title"></strong>
+            <span class="muted" x-text="f.description"></span>
+            <div>
+              <template x-for="e in f.entities"><span class="chip" x-text="e.name" style="margin:0 .25rem .25rem 0"></span></template>
+            </div>
+            <span class="conf muted" x-text="'уверенность ' + Math.round(f.conf * 100) + '%'"></span>
+            <select @change="move(f, $event.target.value)">
+              <template x-for="t in allTopics()"><option :value="t" :selected="t === f.topic" x-text="t"></option></template>
+            </select>
+          </div>
+        </template>
+      </div>
+    </article>
+  </dialog>
+
+  <dialog class="zoom" :open="!!zoom" @click="zoom = null" @keydown.escape.window="zoom = null">
+    <img :src="zoom ? '/img/' + zoom + '?w=1200' : ''" alt="">
+  </dialog>
+
+  <dialog :open="topics.open">
+    <article>
+      <header><strong>Темы (папки)</strong></header>
+      <p class="muted">Одна тема на строку. Вложенная папка через «/», например «Разработка/MCP-серверы». Модель выбирает только из этого списка. Неуверенные скриншоты сами попадут в «Проверить».</p>
+      <textarea class="topics" x-model="topics.text"></textarea>
+      <footer>
+        <button class="secondary" @click="topics.open = false">Отмена</button>
+        <button @click="saveTopics()">Сохранить</button>
+      </footer>
+    </article>
+  </dialog>
+</main>
+
+<script>
+function app() {
+  return {
+    s: { settings: { strong: true }, total: 0, fast_done: 0, strong_done: 0, strong_need: 0, current: [], recent: [], tree: [], models: {},
+         errors: [], phone: {}, setup: {}, windows: false, speed: {}, topics: [], phase: 'idle', msg: '' },
+    folder: { open: false, path: '', items: [] },
+    topics: { open: false, text: '' },
+    zoom: null,
+    counts: {}, bumps: {},
+    bumped(path) { return Date.now() - (this.bumps[path] || 0) < 1200; },
+    init() {
+      const es = new EventSource('/api/events');
+      es.onmessage = e => {
+        const next = JSON.parse(e.data), now = Date.now();
+        for (const [path, n] of next.tree) {
+          const old = this.counts[path];
+          if (old !== undefined && n > old) this.bumps[path] = now;
+          this.counts[path] = n;
+        }
+        this.s = next;
+      };
+    },
+    async post(url, body = {}) {
+      await fetch(url, { method: 'POST', body: JSON.stringify(body) });
+    },
+    phaseLabel() {
+      if (this.s.paused) return 'на паузе';
+      return { idle: 'ожидает', phone: 'копирует с телефона', models: 'готовит модели', fast: 'разбирает',
+               strong: 'перепроверяет', place: 'раскладывает', done: 'готово', error: 'ошибка' }[this.s.phase] || this.s.phase;
+    },
+    ollamaLabel() {
+      return { 'проверяю': 'проверяю…', 'нет': 'не установлена', 'качается': 'скачивается ' + (this.s.setup.pct || 0) + '%',
+               'ставится': 'устанавливается…', 'ошибка': 'ошибка' }[this.s.setup.ollama] || this.s.setup.ollama;
+    },
+    modelName(n) { return n.includes(':8b') ? 'Сильная модель (8B)' : 'Быстрая модель (4B)'; },
+    stageName(st) { return st === 'strong' ? 'сильная модель' : 'быстрая модель'; },
+    eta() {
+      const m = this.s.eta_min;
+      if (!this.s.total || m === undefined) return '—';
+      if (m < 1) return 'меньше минуты';
+      if (m < 60) return Math.round(m) + ' мин';
+      return Math.floor(m / 60) + ' ч ' + Math.round(m % 60) + ' мин';
+    },
+    speed() {
+      const v = this.s.phase === 'strong' ? this.s.speed.strong : this.s.speed.fast;
+      return v ? v.toFixed(1) + ' с на скриншот' : '—';
+    },
+    tree() {
+      const top = {};
+      for (const [path, count] of this.s.tree) {
+        const [head, ...rest] = path.split('/');
+        const g = top[head] ??= { name: head, count: 0, children: [] };
+        g.count += count;
+        if (rest.length) g.children.push({ name: rest.join('/'), path, count });
+      }
+      // «Разработка» первой, «Проверить» и «Разное» в конце, остальные по числу файлов
+      const rank = g => g.name === 'Разработка' ? 0 : g.name === 'Проверить' ? 3 : g.name === 'Разное' ? 2 : 1;
+      for (const g of Object.values(top)) g.children.sort((a, b) => b.count - a.count);
+      return Object.values(top).sort((a, b) => rank(a) - rank(b) || b.count - a.count);
+    },
+    placedCount() { return this.s.tree.reduce((n, [, c]) => n + c, 0); },
+    bar(c) { const max = Math.max(1, ...this.s.tree.map(([, n]) => n)); return c ? Math.max(3, c * 100 / max) : 0; },
+    allTopics() { return [...this.s.topics, 'Проверить']; },
+    async openFolder(path) {
+      this.folder = { open: true, path, items: [] };
+      this.folder.items = await (await fetch('/api/folder?path=' + encodeURIComponent(path))).json();
+    },
+    async move(f, topic) {
+      await this.post('/api/set', { sha: f.sha, topic });
+      f.moved = true;
+    },
+    openTopics() { this.topics = { open: true, text: this.s.topics.join('\n') }; },
+    async saveTopics() {
+      await this.post('/api/topics', { topics: this.topics.text.split('\n') });
+      this.topics.open = false;
+    },
+  };
+}
+</script>
+</body>
+</html>

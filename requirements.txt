@@ -1,0 +1,2 @@
+pillow>=11,<13
+pywebview>=5.4,<7; sys_platform == "win32"

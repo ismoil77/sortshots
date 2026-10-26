@@ -1,0 +1,70 @@
+name: Windows installer
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt "pyinstaller>=6.10,<7"
+
+      - name: Self-test from source
+        run: python desktop.py --selftest
+
+      - name: Build app
+        run: pyinstaller --noconfirm packaging/sortshots.spec
+
+      - name: Self-test built exe
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $p = Start-Process dist\Sortshots\Sortshots.exe -ArgumentList '--selftest' -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            Get-Content "$env:LOCALAPPDATA\Sortshots\selftest.log" -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.1.0' }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=$v" packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Silent install test
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $setup = Get-ChildItem dist\Sortshots-Setup-*.exe | Select-Object -First 1
+          $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit 1 }
+          $exe = "$env:LOCALAPPDATA\Programs\Sortshots\Sortshots.exe"
+          $t = Start-Process $exe -ArgumentList '--selftest' -Wait -PassThru
+          if ($t.ExitCode -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sortshots-Setup
+          path: dist/Sortshots-Setup-*.exe
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Sortshots-Setup-*.exe
