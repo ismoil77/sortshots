@@ -255,7 +255,7 @@
             <div>
               <template x-for="e in f.entities"><span class="chip" x-text="e.name" style="margin:0 .25rem .25rem 0"></span></template>
             </div>
-            <span class="conf muted" x-text="'уверенность ' + Math.round(f.conf * 100) + '%'"></span>
+            <span class="conf muted" x-text="f.why || 'уверенность ' + Math.round(f.conf * 100) + '%'"></span>
             <select @change="move(f, $event.target.value)">
               <template x-for="t in allTopics()"><option :value="t" :selected="t === f.topic" x-text="t"></option></template>
             </select>
@@ -316,9 +316,10 @@
           <label>Что запомнить
             <textarea x-model="hint.text" rows="3" placeholder="Например: карточка контакта с номером — это не переписка, а контакт. Или: «Вахдат» пишется так, а не «Вахдад»."></textarea>
           </label>
-          <label>Найти похожие среди уже разобранных по словам
-            <input x-model="hint.words" placeholder="через запятую: контакт, номер телефона">
-            <small class="muted">Найденные встанут в очередь и разберутся заново первыми.</small>
+          <label>Слова, по которым узнавать
+            <input x-model="hint.words" placeholder="через запятую: семечк, орех, подсолнечн">
+            <small class="muted">Если папка выбрана: скриншоты, в названии которых есть одно из слов, сразу лягут в неё, и уже разобранные тоже.
+              Часть слова ловит все формы: «семечк» — и «семечки», и «семечками». Без папки найденные просто разберутся заново.</small>
           </label>
         </div>
       </template>
@@ -494,7 +495,8 @@ function app() {
         : h.mode === 'redo' ? (r.running ? 'Принято: этот скриншот разберётся следующим.'
                                          : 'Принято: разберётся первым, когда нажмёшь «Продолжить разбор».')
                               + (r.queued > 1 ? ' Следом за ним — ещё ' + (r.queued - 1) + ' таких же экранов.' : '')
-        : 'Запомнено: будет учтено со следующего скриншота.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '');
+        : 'Запомнено: будет учтено со следующего скриншота.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '')
+          + (r.moved ? ' По словам подходят уже разобранные: ' + r.moved + ', они в этой папке.' : '');
       if (r.ok && this.folder.open) this.openFolder(this.folder.path);
     },
     async move(f, topic) {

@@ -406,6 +406,11 @@ class Worker:
             hint["crop"] = S.save_crop(self.by[sha], box, f"hint_{hid}")
         S.save_json(S.HINTS, S.load_json(S.HINTS, []) + [hint])
         pat = S.words_pattern(words)
+        if pat and topic:  # правило со словами и папкой работает без нейросети: разложить заново, и всё
+            with self.lock:
+                moved = sum(1 for r in self.res.values() if r.get("fast") and S.final(r, S.topics())["why"].startswith("правило"))
+            self.place(force=True)
+            return {"ok": True, "queued": queued, "moved": moved}
         if pat:
             with self.lock:
                 queued += S.queue_matching(pat, self.res, skip={sha})
@@ -464,7 +469,7 @@ class Worker:
                 f = S.final(self.res[sha], topics)
                 out.append({"sha": sha, "file": Path(p).name, "topic": f["topic"], "title": f["title"],
                             "description": f["description"], "conf": round(f["confidence"], 2),
-                            "entities": f.get("entities", [])})
+                            "entities": f.get("entities", []), "why": f.get("why", "")})
         return sorted(out, key=lambda x: x["file"])
 
     def set_topic(self, sha, topic=None, title=None):

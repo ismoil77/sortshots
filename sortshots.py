@@ -28,7 +28,9 @@ HINTS = DATA / "hints.json"            # подсказки владельца: 
 QUEUE = DATA / "recheck_queue.json"    # уже разобранные скриншоты, которые надо разобрать заново
 NOTES = DATA / "notes.json"            # комментарии владельца к отдельным скриншотам: «это не то, а вот что»
 EXAMPLES = DATA / "examples"           # вырезанные куски скриншотов — образцы для обучения
-SAME_SCREEN = 0.96  # сходство «тот же экран» (similar.py): тот же набор номера 0.98, чужой экран около 0.7
+# Сходство «тот же экран» (similar.py). На настоящих скриншотах при 0.97 и выше разные темы у пары почти всегда
+# ошибка нейросети (одинаковые экраны набора номера в трёх разных папках), поэтому пример владельца решает сам.
+SAME_SCREEN = 0.97
 CROP_SIDE = 384    # образец до 384 px: около 150 токенов, читается и не раздувает запрос
 
 WIN = sys.platform == "win32"
@@ -358,11 +360,27 @@ def examples_messages(similar):
 
 
 def hints_block():
+    """Правила владельца — в сообщении рядом со скриншотом: маленькая модель так слушается их лучше,
+    чем в общей инструкции, а сама инструкция не меняется и остаётся в кеше Ollama."""
     hints = [h for h in load_json(HINTS, []) if h.get("text")]
     if not hints:
         return ""
     lines = [f"- {h['text']}" + (f" → тема «{h['topic']}»" if h.get("topic") else "") for h in hints]
-    return "\n\nПодсказки владельца скриншотов. Они важнее общих правил выше:\n" + "\n".join(lines)
+    return ("\n\nПравила владельца. Они важнее общих правил: если скриншот подходит под правило, "
+            "ставь тему из правила.\n" + "\n".join(lines))
+
+
+_rules = (None, [])
+
+
+def word_rules():
+    """Подсказки со словами и папкой: [(регулярка, тема, текст)]. Перечитываются, только если файл изменился."""
+    global _rules
+    mtime = HINTS.stat().st_mtime if HINTS.exists() else 0
+    if _rules[0] != mtime:
+        _rules = (mtime, [(p, h["topic"], h.get("text", "")) for h in load_json(HINTS, [])
+                          if h.get("topic") and (p := words_pattern(h.get("words", "")))])
+    return _rules[1]
 
 
 def answer_text(f):
@@ -404,7 +422,7 @@ def add_topic(name):
 
 
 def ask(model, path, topic_list, host=OLLAMA, sha=None, similar=None):
-    user = {"role": "user", "images": [prep_image(path)], "content": "Разбери этот скриншот."}
+    user = {"role": "user", "images": [prep_image(path)], "content": "Разбери этот скриншот." + hints_block()}
     note = load_json(NOTES, {}).get(sha) if sha else None
     if note:
         user["content"] += ("\n\nВладелец уже смотрел этот скриншот и сказал, что прошлый разбор неверный. "
@@ -417,7 +435,7 @@ def ask(model, path, topic_list, host=OLLAMA, sha=None, similar=None):
         "format": schema(topic_list),
         "options": {"temperature": 0, "num_ctx": 6144},
         "messages": [  # инструкция в system: Ollama кеширует её между запросами, модель читает только картинку
-            {"role": "system", "content": PROMPT.format(topics=topic_lines(topic_list or DEFAULT_TOPICS)) + hints_block()},
+            {"role": "system", "content": PROMPT.format(topics=topic_lines(topic_list or DEFAULT_TOPICS))},
             *examples_messages(similar), user],
     }
     req = urllib.request.Request(host + "/api/chat", json.dumps(body).encode(),
@@ -461,14 +479,22 @@ def final(r, topic_list):
         topic = CHECK
     elif max(x["confidence"] for x in (fast, strong) if x) < 0.7:
         topic = CHECK
-    # Почти тот же экран, что владелец уже отнёс к другой теме, а нейросеть спорит — пусть решит человек
-    same = [x for x in best.get("similar", []) if x["score"] >= SAME_SCREEN and x["kind"] == "shot" and x["topic"]]
-    if same and same[0]["topic"] != best["topic"]:
-        topic = CHECK
+    why = ""
+    # Правило со словами: в названии или ключевых словах разбора есть слово из подсказки — сразу в её папку
+    said = " ".join([best.get("title", "")] + best.get("keywords", []))
+    for pat, rule_topic, text in word_rules():
+        if rule_topic in topic_list and pat.search(said):
+            topic, why = rule_topic, f"правило: {text or pat.pattern}"
+            break
+    # Почти тот же экран, что владелец уже разложил сам, — туда же, что бы ни сказала нейросеть
+    same = [x for x in best.get("similar", []) if x["score"] >= SAME_SCREEN and x["kind"] == "shot"
+            and x["topic"] in topic_list + [CHECK]]
+    if same:
+        topic, why = same[0]["topic"], f"как твой пример (сходство {same[0]['score']:.0%})"
     if isinstance(ov, str):  # старый формат: только папка
         ov = {"topic": ov}
     ov = ov or {}
-    out = dict(best, topic=ov.get("topic") or topic)
+    out = dict(best, topic=ov.get("topic") or topic, why="исправлено вручную" if ov.get("topic") else why)
     if ov.get("title"):  # название, исправленное вручную
         out["title"] = ov["title"]
     return out

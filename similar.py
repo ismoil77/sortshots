@@ -16,7 +16,9 @@ TILES = [(0, 1 / 3), (1 / 3, 2 / 3), (2 / 3, 1), (.25, .75)]
 # Пороги сходства, подобраны на настоящих скриншотах: тот же экран 0.97–0.99,
 # родственный (входящий звонок и набор номера) около 0.92, чужой около 0.7
 SHOW = 0.85      # пример показываем нейросети
-CROP_SHOW = 0.83 # выделенный кусок похож на часть скриншота (чужой экран даёт до 0.80)
+# Выделенный кусок: порог свой у каждого. Кнопки набора номера похожи на чужие экраны на 0.80,
+# кусок пакета семечек — на 0.59, поэтому порог = «как похож на случайные скриншоты» + запас.
+CROP_MARGIN, CROP_MIN, CROP_MAX = 0.06, 0.60, 0.85
 QUEUE_SIM = 0.94 # после исправления переразобрать такие же
 
 _sess, _lock, _vec_lock = None, threading.Lock(), threading.Lock()
@@ -108,6 +110,24 @@ def has_vector(sha):
     return "shot:" + sha in _load()
 
 
+_crop_limits = {}
+
+
+def crop_threshold(rel):
+    """Порог для выделенного куска: выше, чем у 99% уже разобранных скриншотов, плюс запас."""
+    if rel not in _crop_limits:
+        vs = _load()
+        with _vec_lock:
+            bg = [v for k, v in vs.items() if k.startswith("tiles:")][:400] or \
+                 [v[None] for k, v in vs.items() if k.startswith("shot:")][:1500]
+        if not bg:
+            return CROP_MAX
+        sims = (np.concatenate(bg).astype(np.float32) @ crop_vector(rel))
+        per_shot = sims.reshape(len(bg), -1).max(1) if bg[0].ndim == 2 and len(bg[0]) > 1 else sims
+        _crop_limits[rel] = float(np.clip(np.percentile(per_shot, 99) + CROP_MARGIN, CROP_MIN, CROP_MAX))
+    return _crop_limits[rel]
+
+
 def crop_vector(rel):
     def make():
         with Image.open(S.DATA / rel) as im:
@@ -150,7 +170,7 @@ def nearest(sha, path, by, k=3):
     for e in ex:
         if e["kind"] == "crop":  # выделенный кусок ищем во всём скриншоте и в его частях
             score = float((t @ crop_vector(e["crop"])).max())
-            if score >= CROP_SHOW:
+            if score >= crop_threshold(e["crop"]):
                 scored.append((score, e))
         else:
             score = float(v @ shot_vector(e["sha"], by[e["sha"]]))
