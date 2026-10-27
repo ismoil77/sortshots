@@ -225,6 +225,9 @@
                     style="width:100%;margin-top:.3rem;padding:.3rem" x-text="name.includes(':8b') ? 'Скачать (≈ 6 ГБ)' : 'Скачать (≈ 3,3 ГБ)'"></button>
           </div>
         </template>
+        <div class="model" title="Находит скриншоты, похожие на те, что ты исправил или выделил, и показывает их нейросети как примеры">
+          Поиск похожих (обучение) · <span class="muted" x-text="s.similar || '—'"></span>
+        </div>
         <p class="muted">Нейросеть работает на этом компьютере: скриншоты никуда не отправляются.</p>
       </article>
 
@@ -487,9 +490,10 @@ function app() {
         mode: h.mode, sha: h.sha, text: h.text, title: h.mode === 'redo' ? '' : h.newTitle.trim(),
         topic: h.newTopic.trim() || h.topic, words: h.words, box: h.mode === 'one' ? null : h.box }) })).json();
       h.result = !r.ok ? 'Не сохранилось: ' + r.error
-        : h.mode === 'one' ? 'Исправлено.'
+        : h.mode === 'one' ? 'Исправлено.' + (r.queued ? ' Таких же экранов среди разобранных: ' + r.queued + ', они разберутся заново с этим примером.' : '')
         : h.mode === 'redo' ? (r.running ? 'Принято: этот скриншот разберётся следующим.'
                                          : 'Принято: разберётся первым, когда нажмёшь «Продолжить разбор».')
+                              + (r.queued > 1 ? ' Следом за ним — ещё ' + (r.queued - 1) + ' таких же экранов.' : '')
         : 'Запомнено: будет учтено со следующего скриншота.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '');
       if (r.ok && this.folder.open) this.openFolder(this.folder.path);
     },

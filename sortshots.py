@@ -28,7 +28,7 @@ HINTS = DATA / "hints.json"            # подсказки владельца: 
 QUEUE = DATA / "recheck_queue.json"    # уже разобранные скриншоты, которые надо разобрать заново
 NOTES = DATA / "notes.json"            # комментарии владельца к отдельным скриншотам: «это не то, а вот что»
 EXAMPLES = DATA / "examples"           # вырезанные куски скриншотов — образцы для обучения
-MAX_EXAMPLES = 6   # больше образцов не влезет в контекст рядом со скриншотом
+SAME_SCREEN = 0.96  # сходство «тот же экран» (similar.py): тот же набор номера 0.98, чужой экран около 0.7
 CROP_SIDE = 384    # образец до 384 px: около 150 токенов, читается и не раздувает запрос
 
 WIN = sys.platform == "win32"
@@ -310,11 +310,6 @@ def prep_image(path):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def crop_hints():
-    """Подсказки с выделенным куском скриншота: модель видит их как картинки-образцы."""
-    return [h for h in load_json(HINTS, []) if h.get("crop") and (DATA / h["crop"]).exists()][-MAX_EXAMPLES:]
-
-
 def save_crop(path, box, name):
     """Вырезать часть скриншота (box — доли от 0 до 1: x, y, ширина, высота) в образец. Вернёт путь от DATA."""
     x, y, w, h = (max(0.0, min(1.0, float(v))) for v in box)
@@ -334,22 +329,36 @@ def b64_file(path):
     return base64.b64encode(Path(path).read_bytes()).decode()
 
 
-def examples_messages():
-    """Образцы идут отдельной парой сообщений перед скриншотом: префикс одинаковый, Ollama его кеширует."""
-    ex = crop_hints()
-    if not ex:
+def small_image(path, side=448):
+    """Пример для нейросети: виден вид экрана, а мелкий текст не нужен — так он дешевле в токенах."""
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((side, side))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def examples_messages(similar):
+    """Похожие примеры владельца (их находит similar.nearest) — отдельной парой сообщений перед скриншотом."""
+    if not similar:
         return []
-    lines = [f"Картинка {i}: {h['text'] or 'пример'}" + (f" → тема «{h['topic']}»" if h.get("topic") else "")
-             for i, h in enumerate(ex, 1)]
-    return [{"role": "user", "images": [b64_file(DATA / h["crop"]) for h in ex],
-             "content": "Это куски скриншотов, которые выделил владелец, и что они значат:\n" + "\n".join(lines)
-                        + "\nЕсли на скриншоте есть похожее (тот же интерфейс, значок, форма), применяй это правило."},
-            {"role": "assistant", "content": "Понял, буду сверять скриншоты с этими образцами."}]
+    images, lines = [], []
+    for i, (score, e) in enumerate(similar, 1):
+        images.append(b64_file(DATA / e["crop"]) if e["kind"] == "crop" else small_image(e["path"]))
+        what = "кусок скриншота, который выделил владелец" if e["kind"] == "crop" else "похожий скриншот"
+        lines.append(f"Картинка {i} — {what} (сходство {score:.0%})"
+                     + (f": владелец отнёс его к теме «{e['topic']}»" if e.get("topic") else "")
+                     + (f". Владелец пояснил: {e['text']}" if e.get("text") else "") + ".")
+    return [{"role": "user", "images": images,
+             "content": "Примеры, на которых владелец тебя поправил. Они похожи на скриншот, который будет дальше:\n"
+                        + "\n".join(lines)
+                        + "\nЕсли скриншот действительно такой же по смыслу, разбери его так, как хочет владелец."},
+            {"role": "assistant", "content": "Понял, учту эти примеры."}]
 
 
 def hints_block():
-    with_crop = {h["id"] for h in crop_hints()}
-    hints = [h for h in load_json(HINTS, []) if h["id"] not in with_crop]  # подсказки с образцом уже в картинках
+    hints = [h for h in load_json(HINTS, []) if h.get("text")]
     if not hints:
         return ""
     lines = [f"- {h['text']}" + (f" → тема «{h['topic']}»" if h.get("topic") else "") for h in hints]
@@ -394,7 +403,7 @@ def add_topic(name):
     return t
 
 
-def ask(model, path, topic_list, host=OLLAMA, sha=None):
+def ask(model, path, topic_list, host=OLLAMA, sha=None, similar=None):
     user = {"role": "user", "images": [prep_image(path)], "content": "Разбери этот скриншот."}
     note = load_json(NOTES, {}).get(sha) if sha else None
     if note:
@@ -409,13 +418,15 @@ def ask(model, path, topic_list, host=OLLAMA, sha=None):
         "options": {"temperature": 0, "num_ctx": 6144},
         "messages": [  # инструкция в system: Ollama кеширует её между запросами, модель читает только картинку
             {"role": "system", "content": PROMPT.format(topics=topic_lines(topic_list or DEFAULT_TOPICS)) + hints_block()},
-            *examples_messages(), user],
+            *examples_messages(similar), user],
     }
     req = urllib.request.Request(host + "/api/chat", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         out = json.loads(json.loads(r.read())["message"]["content"])
     out["confidence"] = max(0.0, min(1.0, float(out.get("confidence") or 0)))
+    if similar:  # на какие примеры опиралась: нужно, чтобы поймать спор с примером владельца
+        out["similar"] = [{"score": sc, "topic": e.get("topic", ""), "kind": e["kind"]} for sc, e in similar]
     return out
 
 
@@ -449,6 +460,10 @@ def final(r, topic_list):
     if strong and fast and strong["topic"] != fast["topic"]:
         topic = CHECK
     elif max(x["confidence"] for x in (fast, strong) if x) < 0.7:
+        topic = CHECK
+    # Почти тот же экран, что владелец уже отнёс к другой теме, а нейросеть спорит — пусть решит человек
+    same = [x for x in best.get("similar", []) if x["score"] >= SAME_SCREEN and x["kind"] == "shot" and x["topic"]]
+    if same and same[0]["topic"] != best["topic"]:
         topic = CHECK
     if isinstance(ov, str):  # старый формат: только папка
         ov = {"topic": ov}

@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 from PIL import Image
 
+import similar as SIM
 import sortshots as S
 
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)).resolve()  # _MEIPASS — внутри собранного .exe
@@ -38,6 +39,8 @@ class Worker:
         self.by = dict(S.index_sources()) if S.SRC.exists() else {}
         self.last_place = 0
         self.skip = set()  # не разобрались из-за ошибки в этом запуске
+        self.done_since_save = 0
+        self.sim_status = "готова" if SIM.ready() else "скачается при запуске"
         threading.Thread(target=self.check_models, daemon=True).start()
 
     # ---- состояние для страницы ----
@@ -64,7 +67,7 @@ class Worker:
                 "current": [dict(v, sha=k, secs=round(now - v["since"])) for k, v in self.current.items()],
                 "recent": list(self.recent)[::-1],
                 "tree": sorted(tree.items()),
-                "models": self.models, "phone": self.phone, "setup": self.setup, "windows": S.WIN,
+                "models": self.models, "phone": self.phone, "setup": self.setup, "similar": self.sim_status, "windows": S.WIN,
                 "errors": list(self.errors)[::-1],
                 "root": str(S.ROOT), "topics": topics,
                 "settings": S.load_json(SETTINGS, {"strong": True}),
@@ -253,7 +256,12 @@ class Worker:
                 t0 = time.time()
                 topics = S.topics()  # новая папка из подсказки доступна модели сразу
                 try:
-                    out = S.ask(model, p, topics, sha=sha)
+                    try:  # похожие примеры владельца; без них разбор всё равно идёт
+                        similar = SIM.nearest(sha, p, self.by)
+                    except Exception as e:
+                        similar = None
+                        self.errors.append(f"поиск похожих: {e}")
+                    out = S.ask(model, p, topics, sha=sha, similar=similar)
                     S.append_result({"sha": sha, "src": p.relative_to(S.SRC).as_posix(), stage: out})
                     with self.lock:
                         r = self.res.setdefault(sha, {"sha": sha, "src": p.relative_to(S.SRC).as_posix()})
@@ -265,6 +273,9 @@ class Worker:
                     self.stats[stage]["times"].append(time.time() - t0)
                     if after:
                         after(sha)
+                    self.done_since_save += 1
+                    if self.done_since_save >= 25:  # векторы похожести не терять при сбое
+                        self.save_vectors()
                     self.place()
                 except Exception as e:  # битый файл или сбой модели: записываем и идём дальше
                     self.errors.append(f"{p.name}: {e}")
@@ -293,6 +304,7 @@ class Worker:
                 raise RuntimeError("Сначала установи Ollama: кнопка в карточке «Модели»") from None
             self.phase, self.msg = "models", "Проверяю модели"
             self.pull(S.FAST)
+            self.fetch_similar()
             strong = threading.Thread(target=self.pull, args=(S.STRONG,), daemon=True)
             strong.start()  # сильная модель докачивается, пока работает быстрая
             topics = S.topics()
@@ -329,10 +341,41 @@ class Worker:
             self.phase, self.msg = "error", str(e)
             traceback.print_exc()
         finally:
+            self.save_vectors()
             if self.stop.is_set():
                 self.place(force=True)
                 self.phase, self.msg = "idle", "Остановлено. Продолжить можно в любой момент."
             self.current.clear()
+
+    def fetch_similar(self):
+        """Модель поиска похожих (около 370 МБ, один раз). Не скачалась — разбор идёт без неё."""
+        if SIM.ready():
+            self.sim_status = "готова"
+            return
+        self.phase, self.msg = "models", "Скачиваю модель поиска похожих скриншотов"
+        try:
+            SIM.fetch(lambda done, total: setattr(self, "sim_status", f"скачивается {done * 100 // max(total, 1)}%"))
+            self.sim_status = "готова"
+        except Exception as e:
+            self.sim_status = "ошибка"
+            self.errors.append(f"модель поиска похожих: {e}")
+
+    def save_vectors(self):
+        self.done_since_save = 0
+        try:
+            SIM.save()
+        except Exception as e:
+            self.errors.append(f"векторы похожих: {e}")
+
+    def queue_similar(self, sha):
+        """Исправил один — переразобрать такие же экраны, уже разобранные раньше. Вернёт сколько."""
+        try:
+            with self.lock:
+                done = [s for s in self.by if "fast" in self.res.get(s, {})]
+            return S.queue_add(SIM.similar_shots(sha, self.by, done))
+        except Exception as e:
+            self.errors.append(f"поиск похожих: {e}")
+            return 0
 
     def queue_left(self):
         return any(s in self.by for s in S.load_json(S.QUEUE, []))
@@ -353,19 +396,19 @@ class Worker:
             return self.redo_one(sha, text, topic, box)
         if sha and (topic or title):
             self.set_topic(sha, topic, title)
+        queued = self.queue_similar(sha) if sha and (topic or mode == "all") else 0
         if mode == "one":
-            return {"ok": True, "queued": 0}
+            return {"ok": True, "queued": queued}
         hid = int(time.time() * 1000)
         hint = {"id": hid, "text": text.strip(), "topic": topic or "", "words": words.strip(),
                 "sha": sha or "", "created": time.strftime("%Y-%m-%d %H:%M")}
         if box and sha in self.by:
             hint["crop"] = S.save_crop(self.by[sha], box, f"hint_{hid}")
         S.save_json(S.HINTS, S.load_json(S.HINTS, []) + [hint])
-        queued = 0
         pat = S.words_pattern(words)
         if pat:
             with self.lock:
-                queued = S.queue_matching(pat, self.res, skip={sha})
+                queued += S.queue_matching(pat, self.res, skip={sha})
         return {"ok": True, "queued": queued}
 
     def redo_one(self, sha, text, topic, box):
@@ -381,8 +424,15 @@ class Worker:
         ov = S.load_json(S.OVERRIDES, {})
         if ov.pop(sha, None) is not None:  # прошлое ручное исправление больше не держит скриншот на месте
             S.save_json(S.OVERRIDES, ov)
-        S.queue_add([sha], front=True)
-        return {"ok": True, "queued": 1, "running": bool(self.thread and self.thread.is_alive())}
+        try:  # такие же экраны, скорее всего, разобраны так же неверно — следом за ним
+            with self.lock:
+                done = [s for s in self.by if "fast" in self.res.get(s, {})]
+            same = SIM.similar_shots(sha, self.by, done)
+        except Exception as e:
+            same = []
+            self.errors.append(f"поиск похожих: {e}")
+        S.queue_add([sha] + same, front=True)
+        return {"ok": True, "queued": 1 + len(same), "running": bool(self.thread and self.thread.is_alive())}
 
     def redo_all(self):
         """После обучения: заново разобрать всё, что уже разобрано. Ручные исправления остаются."""
@@ -542,6 +592,7 @@ class H(BaseHTTPRequestHandler):
             W.stop.set()
         elif p == "/api/set":
             W.set_topic(body["sha"], body["topic"])
+            return self.send({"ok": True, "queued": W.queue_similar(body["sha"])})
         elif p == "/api/topics":
             t = [x.strip() for x in body["topics"] if x.strip()]
             S.save_json(S.TOPICS, t)
