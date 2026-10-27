@@ -47,7 +47,7 @@ DEV = [
     "Разработка/Другие инструменты",
 ]
 DEFAULT_TOPICS = DEV + [
-    "Переписки", "Банк и платежи", "Покупки и заказы", "Документы и справки",
+    "Переписки", "Контакты и звонки", "Банк и платежи", "Покупки и заказы", "Документы и справки",
     "Соцсети и посты", "Видео и музыка", "Карты и адреса", "Мемы и картинки",
     "Учёба и статьи", "Настройки телефона", OTHER,
 ]
@@ -68,6 +68,8 @@ TOPIC_HINTS = {
     "Разработка/Код и ошибки": "код, терминал, логи, стектрейсы, сообщения об ошибках, редактор кода",
     "Разработка/Другие инструменты": "прочие программы, библиотеки, сервисы и CLI для разработчиков и дизайнеров (не AI)",
     "Переписки": "чаты в мессенджерах, SMS, письма — главное здесь разговор людей",
+    "Контакты и звонки": "карточка контакта, номер телефона, профиль человека или компании (в телефонной книге, "
+        "Telegram, WhatsApp), экран звонка, журнал вызовов",
     "Банк и платежи": "переводы, чеки, балансы, банковские приложения, оплата, курсы валют",
     "Покупки и заказы": "товары, цены, корзина, заказы, доставка, маркетплейсы",
     "Документы и справки": "паспорт, справки, билеты, договоры, госуслуги, официальные бумаги",
@@ -96,6 +98,7 @@ topic — ровно одна тема из списка:
 
 Как выбирать тему:
 1. Решай по главному содержимому, а не по приложению. Пост в Telegram про перевод денег — «Банк и платежи».
+   Карточка или профиль человека с номером, экран звонка — «Контакты и звонки», а не «Переписки»: переписка — это когда видны сообщения.
 2. Разработка важнее всего: если главное на экране — программирование, ИИ, репозиторий, скил или MCP, выбирай «Разработка/…», даже если это пост в соцсети, переписка или видео.
 3. Если подходит несколько тем «Разработка/…», бери самую конкретную в таком порядке: MCP-серверы, Claude скилы и плагины, GitHub-репозитории, AI-инструменты и модели, Код и ошибки, Другие инструменты.
 
@@ -356,7 +359,7 @@ def final(r, topic_list):
 
 def needs_strong(r, topic_list):
     f = r.get("fast")
-    return f and "strong" not in r and (
+    return f and not r.get("strong") and (
         f["confidence"] < 0.8 or f["topic"].startswith("Разработка/") or f["topic"] not in topic_list)
 
 
@@ -598,6 +601,34 @@ def cmd_run(a):
     place()
 
 
+CONTACT_HINT = r"контакт|профил|звон|вызов|визитк|номер телефона|телефонн"
+
+
+def cmd_recheck(a):
+    """Заново разобрать быстрой моделью только скриншоты, где в прошлом ответе есть a.match (например, после новой темы)."""
+    ensure_ollama()
+    topic_list = topics()
+    if a.add_topic and a.add_topic not in topic_list and not a.dry_run:
+        topic_list.insert(len(topic_list) - 1 if topic_list[-1] == OTHER else len(topic_list), a.add_topic)
+        save_json(TOPICS, topic_list)
+        print("Добавлена тема:", a.add_topic)
+    res, by = load_results(), dict(index_sources())
+    pat = re.compile(a.match, re.I)
+    todo = []
+    for sha, r in res.items():
+        f = r.get("fast")
+        text = " ".join([f.get(k, "") for k in ("app", "seen", "title", "description")] + f.get("keywords", [])) if f else ""
+        if sha in by and pat.search(text):
+            todo.append((sha, by[sha]))
+    print(f"Под перепроверку: {len(todo)} из {len(res)}")
+    if todo and not a.dry_run:
+        analyze(todo, FAST, "fast", topic_list)
+        for sha, _ in todo:  # старая перепроверка сильной моделью относилась к прежнему ответу
+            if res[sha].get("strong"):
+                append_result({"sha": sha, "src": res[sha]["src"], "strong": None})
+        place()
+
+
 def cmd_place(_):
     place()
 
@@ -621,6 +652,11 @@ def main():
     r.add_argument("--no-strong", action="store_true", help="без перепроверки сильной моделью")
     r.set_defaults(f=cmd_run)
     sub.add_parser("place").set_defaults(f=cmd_place)
+    rc = sub.add_parser("recheck", help="перепроверить часть скриншотов (по умолчанию — похожие на контакты)")
+    rc.add_argument("--match", default=CONTACT_HINT, help="регулярное выражение по прошлому ответу модели")
+    rc.add_argument("--add-topic", default="Контакты и звонки", help="добавить тему, если её ещё нет ('' — не добавлять)")
+    rc.add_argument("--dry-run", action="store_true", help="только посчитать")
+    rc.set_defaults(f=cmd_recheck)
     sub.add_parser("app").set_defaults(f=cmd_app)
     a = ap.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)

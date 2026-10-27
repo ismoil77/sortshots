@@ -46,8 +46,8 @@ class Worker:
             topics = S.topics()
             fast_done = sum(1 for s in self.by if "fast" in self.res.get(s, {}))
             strong_need = sum(1 for s in self.by if self.res.get(s, {}).get("fast")
-                              and (S.needs_strong(self.res[s], topics) or "strong" in self.res[s]))
-            strong_done = sum(1 for s in self.by if "strong" in self.res.get(s, {}))
+                              and (S.needs_strong(self.res[s], topics) or self.res[s].get("strong")))
+            strong_done = sum(1 for s in self.by if self.res.get(s, {}).get("strong"))
             placed = S.load_json(S.PLACED, {})
             tree = Counter(Path(p).parent.relative_to(S.ROOT).as_posix() for s, p in placed.items() if s in self.by)
             for t in topics + [S.CHECK]:  # пустые папки тоже показываем, чтобы структура была видна сразу
