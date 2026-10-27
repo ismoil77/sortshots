@@ -3,7 +3,7 @@
 import json, mimetypes, shutil, socket, subprocess, sys, threading, time, traceback, urllib.request
 from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
 from PIL import Image
@@ -52,8 +52,8 @@ class Worker:
             strong_need = sum(1 for s in self.by if self.res.get(s, {}).get("fast")
                               and (S.needs_strong(self.res[s], topics) or self.res[s].get("strong")))
             strong_done = sum(1 for s in self.by if self.res.get(s, {}).get("strong"))
-            placed = S.load_json(S.PLACED, {})
-            tree = Counter(Path(p).parent.relative_to(S.ROOT).as_posix() for s, p in placed.items() if s in self.by)
+            placed = S.load_placed()
+            tree = Counter(str(PurePosixPath(p).parent) for s, p in placed.items() if s in self.by)
             for t in topics + [S.CHECK]:  # пустые папки тоже показываем, чтобы структура была видна сразу
                 tree.setdefault(t, 0)
             now = time.time()
@@ -212,11 +212,11 @@ class Worker:
         with self.place_lock:
             S.place(verbose=False)
             self.last_place = time.time()
-            placed = S.load_json(S.PLACED, {})
+            placed = S.load_placed()
             with self.lock:
                 for r in self.recent:
                     if r["sha"] in placed:
-                        r["file"] = Path(placed[r["sha"]]).relative_to(S.ROOT).as_posix()
+                        r["file"] = placed[r["sha"]]
 
     def fast_todo(self):
         """Сначала очередь перепроверки (её пополняют прямо во время разбора), потом ещё не разобранные."""
@@ -457,10 +457,10 @@ class Worker:
     # ---- проверка ----
 
     def folder(self, rel):
-        topics, placed = S.topics(), S.load_json(S.PLACED, {})
+        topics, placed = S.topics(), S.load_placed()
         out = []
         for sha, p in placed.items():
-            if sha in self.res and Path(p).parent.relative_to(S.ROOT).as_posix() == rel:
+            if sha in self.res and str(PurePosixPath(p).parent) == rel:
                 f = S.final(self.res[sha], topics)
                 out.append({"sha": sha, "file": Path(p).name, "topic": f["topic"], "title": f["title"],
                             "description": f["description"], "conf": round(f["confidence"], 2),

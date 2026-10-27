@@ -41,7 +41,13 @@ def selftest():
     with urllib.request.urlopen(base + "/api/events") as r:
         snap = json.loads(r.readline().decode("utf-8")[6:])
     assert "Разработка/MCP-серверы" in snap["topics"], "нет тем"
-    print("selftest ok:", snap["phase"], "root =", snap["root"], "ollama =", snap["setup"])
+    import onnxruntime, similar  # поиск похожих: грузит родную библиотеку (на Windows — DLL)
+    assert "CPUExecutionProvider" in onnxruntime.get_available_providers(), "onnxruntime без CPU"
+    if similar.ready():
+        from PIL import Image
+        v = similar.embed([Image.new("RGB", (100, 200), "white")])
+        assert v.shape == (1, 768), f"вектор {v.shape}"
+    print("selftest ok:", snap["phase"], "root =", snap["root"], "ollama =", snap["setup"], "похожие =", snap["similar"])
 
 
 def main():

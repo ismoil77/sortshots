@@ -571,9 +571,22 @@ def clean_name(s):
     return re.sub(r"\s+", " ", s)[:90] or "скриншот"
 
 
+def load_placed():
+    """Куда разложен каждый скриншот: {sha: путь от ROOT}. Пути относительные, чтобы папку можно было
+    перенести (или открыть с другого диска/системы). Старые записи с полным путём вне ROOT пропускаем."""
+    out, root = {}, ROOT.as_posix().rstrip("/") + "/"
+    for sha, p in load_json(PLACED, {}).items():
+        p = p.replace("\\", "/")
+        if p.lower().startswith(root.lower()):
+            out[sha] = p[len(root):]
+        elif not (p.startswith("/") or re.match(r"^[A-Za-z]:", p)):
+            out[sha] = p
+    return out
+
+
 def place(verbose=True):
     topic_list, res = topics(), load_results()
-    placed, taken = load_json(PLACED, {}), set()
+    placed, taken = load_placed(), set()
     by_src = {p.relative_to(SRC).as_posix(): p for p in sources()}
     rows, ents = [], []
     for sha, r in sorted(res.items(), key=lambda kv: kv[1]["src"]):
@@ -588,14 +601,13 @@ def place(verbose=True):
             name, n = f"{base} ({n}){src.suffix.lower()}", n + 1
         dst = folder / name
         taken.add(str(dst))
-        old = placed.get(sha)
-        if old != str(dst) or not dst.exists():
-            if old and Path(old).exists() and Path(old) != dst:
-                Path(old).unlink()
+        old, rel = placed.get(sha), dst.relative_to(ROOT).as_posix()
+        if old != rel or not dst.exists():
+            if old and old != rel and (ROOT / old).exists():
+                (ROOT / old).unlink()
             folder.mkdir(parents=True, exist_ok=True)
             write_with_meta(src, dst, info)
-            placed[sha] = str(dst)
-        rel = dst.relative_to(ROOT).as_posix()
+            placed[sha] = rel
         rows.append([str(rel), info["topic"], info["title"], info["description"],
                      ", ".join(info["keywords"]), f"{info['confidence']:.2f}", r["src"]])
         ents += [(e, info, rel) for e in info.get("entities", []) if e.get("name")]

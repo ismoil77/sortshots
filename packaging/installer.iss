@@ -1,7 +1,7 @@
 ﻿; Inno Setup 6: установщик для Windows. Файл в UTF-8 с BOM — иначе кириллица сломается.
 ; Сборка: ISCC.exe /DAppVersion=1.0.0 packaging\installer.iss  (после pyinstaller)
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 
 [Setup]

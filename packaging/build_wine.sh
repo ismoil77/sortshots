@@ -44,7 +44,8 @@ wine "$PY" -m PyInstaller --noconfirm --log-level WARN \
   "$(winepath -w "$ROOT/packaging/sortshots.spec")"
 
 echo "→ самопроверка собранного .exe"
-wine "$(winepath -w "$WORK/dist/Sortshots/Sortshots.exe")" --selftest
+# своя пустая папка: самопроверка не должна видеть настоящие скриншоты (Wine открывает домашнюю папку Linux)
+SORTSHOTS_ROOT='C:\sortshots-selftest' wine "$(winepath -w "$WORK/dist/Sortshots/Sortshots.exe")" --selftest
 
 echo "→ Inno Setup"
 # ISCC берёт ..\dist относительно .iss, поэтому кладём сборку туда же, куда её кладёт CI
