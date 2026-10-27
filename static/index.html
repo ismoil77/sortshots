@@ -84,6 +84,7 @@
       <button @click="post('/api/resume')" x-show="s.running && s.paused">Продолжить</button>
       <button class="secondary outline" @click="post('/api/stop')" x-show="s.running">Стоп</button>
       <button class="secondary outline" @click="openTopics()" :disabled="s.running">Темы</button>
+      <button class="secondary outline" @click="hintsOpen = true" x-text="'Подсказки' + (s.hints.length ? ' · ' + s.hints.length : '')"></button>
     </div>
   </header>
   <div style="display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;align-items:center">
@@ -113,6 +114,7 @@
           <span>Осталось примерно: <b x-text="eta()"></b></span>
           <span>Скорость: <b x-text="speed()"></b></span>
           <span>Перепроверено: <b x-text="s.strong_done + ' из ' + s.strong_need"></b></span>
+          <span x-show="s.queue">Ждут перепроверки по подсказкам: <b x-text="s.queue"></b></span>
         </div>
         <template x-if="s.strong_need">
           <div style="margin-top:.6rem">
@@ -241,6 +243,7 @@
             <select @change="move(f, $event.target.value)">
               <template x-for="t in allTopics()"><option :value="t" :selected="t === f.topic" x-text="t"></option></template>
             </select>
+            <button class="secondary outline" style="padding:.25rem .5rem;font-size:.8rem;margin:0" @click="openHint(f)">Подсказать</button>
           </div>
         </template>
       </div>
@@ -249,6 +252,60 @@
 
   <dialog class="zoom" :open="!!zoom" @click="zoom = null" @keydown.escape.window="zoom = null">
     <img :src="zoom ? '/img/' + zoom + '?w=1200' : ''" alt="">
+  </dialog>
+
+  <dialog :open="hint.open" @keydown.escape.window="hint.open = false">
+    <article style="width:min(640px,96vw)">
+      <header><strong>Подсказка для нейросети</strong></header>
+      <div style="display:grid;grid-template-columns:120px 1fr;gap:1rem;align-items:start">
+        <img :src="hint.sha ? '/img/' + hint.sha + '?w=240' : ''" alt="" style="width:120px;border-radius:8px">
+        <div>
+          <p class="muted" style="margin:0 0 .4rem">Модель ничего не запоминает сама. Подсказка добавится в её инструкцию для всех следующих скриншотов.</p>
+          <span class="muted" x-text="'Сейчас: ' + hint.title"></span>
+        </div>
+      </div>
+      <label>Что здесь и как такое раскладывать
+        <textarea x-model="hint.text" rows="3" placeholder="Например: карточка контакта с номером из телефонной книги — это не переписка"></textarea>
+      </label>
+      <div class="grid">
+        <label>Папка для таких
+          <select x-model="hint.topic">
+            <option value="">— не указывать —</option>
+            <template x-for="t in allTopics()"><option :value="t" x-text="t"></option></template>
+          </select>
+        </label>
+        <label>…или новая папка
+          <input x-model="hint.newTopic" placeholder="Например: Рецепты">
+        </label>
+      </div>
+      <label>Найти похожие среди уже разобранных по словам
+        <input x-model="hint.words" placeholder="через запятую: контакт, номер телефона">
+        <small class="muted">Нашлись — встанут в очередь и разберутся заново при следующем запуске разбора.</small>
+      </label>
+      <p x-show="hint.result" x-text="hint.result"></p>
+      <footer>
+        <button class="secondary" @click="hint.open = false" x-text="hint.result ? 'Закрыть' : 'Отмена'"></button>
+        <button @click="saveHint()" :disabled="!hint.text.trim() || hint.result">Сохранить</button>
+      </footer>
+    </article>
+  </dialog>
+
+  <dialog :open="hintsOpen" @keydown.escape.window="hintsOpen = false">
+    <article style="width:min(720px,96vw)">
+      <header><strong>Подсказки</strong></header>
+      <p class="muted" x-show="!s.hints.length">Пока пусто. Открой папку, найди скриншот, который лежит не там, и нажми «Подсказать».</p>
+      <template x-for="h in s.hints" :key="h.id">
+        <div style="display:flex;gap:.8rem;align-items:start;padding:.5rem 0;border-bottom:1px solid var(--pico-muted-border-color)">
+          <img x-show="h.sha" :src="'/img/' + h.sha + '?w=120'" alt="" style="width:44px;border-radius:5px">
+          <div style="flex:1">
+            <div x-text="h.text"></div>
+            <small class="muted" x-text="(h.topic ? '→ ' + h.topic + ' · ' : '') + (h.words ? 'похожие: ' + h.words + ' · ' : '') + h.created"></small>
+          </div>
+          <button class="secondary outline" style="width:auto;margin:0;padding:.2rem .6rem" @click="post('/api/hints/delete', {id: h.id})">Удалить</button>
+        </div>
+      </template>
+      <footer><button @click="hintsOpen = false">Закрыть</button></footer>
+    </article>
   </dialog>
 
   <dialog :open="topics.open">
@@ -268,10 +325,12 @@
 function app() {
   return {
     s: { settings: { strong: true }, total: 0, fast_done: 0, strong_done: 0, strong_need: 0, current: [], recent: [], tree: [], models: {},
-         errors: [], phone: {}, setup: {}, windows: false, speed: {}, topics: [], phase: 'idle', msg: '' },
+         errors: [], phone: {}, setup: {}, windows: false, hints: [], queue: 0, speed: {}, topics: [], phase: 'idle', msg: '' },
     folder: { open: false, path: '', items: [] },
     topics: { open: false, text: '' },
     zoom: null,
+    hint: { open: false, sha: '', title: '', text: '', topic: '', newTopic: '', words: '', result: '' },
+    hintsOpen: false,
     counts: {}, bumps: {},
     bumped(path) { return Date.now() - (this.bumps[path] || 0) < 1200; },
     init() {
@@ -330,6 +389,16 @@ function app() {
     async openFolder(path) {
       this.folder = { open: true, path, items: [] };
       this.folder.items = await (await fetch('/api/folder?path=' + encodeURIComponent(path))).json();
+    },
+    openHint(f) {
+      this.hint = { open: true, sha: f.sha, title: f.title, text: '', topic: '', newTopic: '', words: '', result: '' };
+    },
+    async saveHint() {
+      const h = this.hint;
+      const r = await (await fetch('/api/hints', { method: 'POST', body: JSON.stringify({
+        sha: h.sha, text: h.text, topic: h.newTopic.trim() || h.topic, words: h.words }) })).json();
+      h.result = r.ok ? 'Сохранено.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '') : 'Не сохранилось: ' + r.error;
+      if (r.ok && this.folder.open) this.openFolder(this.folder.path);
     },
     async move(f, topic) {
       await this.post('/api/set', { sha: f.sha, topic });

@@ -24,6 +24,8 @@ RESULTS = DATA / "results.jsonl"
 TOPICS = DATA / "topics.json"
 OVERRIDES = DATA / "overrides.json"
 PLACED = DATA / "placed.json"
+HINTS = DATA / "hints.json"            # подсказки владельца: попадают в инструкцию модели
+QUEUE = DATA / "recheck_queue.json"    # уже разобранные скриншоты, которые надо разобрать заново
 
 WIN = sys.platform == "win32"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if WIN else 0  # на Windows не мигать чёрными окнами консоли
@@ -304,13 +306,50 @@ def prep_image(path):
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def hints_block():
+    hints = load_json(HINTS, [])
+    if not hints:
+        return ""
+    lines = [f"- {h['text']}" + (f" → тема «{h['topic']}»" if h.get("topic") else "") for h in hints]
+    return "\n\nПодсказки владельца скриншотов. Они важнее общих правил выше:\n" + "\n".join(lines)
+
+
+def answer_text(f):
+    """Текст прошлого ответа модели, по которому ищем похожие скриншоты."""
+    return " ".join([f.get(k, "") for k in ("app", "seen", "title", "description")] + f.get("keywords", [])) if f else ""
+
+
+def words_pattern(words):
+    """«контакт, номер телефона» → регулярка, которая находит любое из слов."""
+    parts = [re.escape(w.strip()) for w in re.split(r"[,;\n]", words) if w.strip()]
+    return re.compile("|".join(parts), re.I) if parts else None
+
+
+def queue_matching(pattern, res=None, skip=()):
+    """Поставить в очередь перепроверки разобранные скриншоты, чей ответ подходит под pattern. Вернёт сколько."""
+    res = res if res is not None else load_results()
+    shas = [sha for sha, r in res.items() if sha not in skip and pattern.search(answer_text(r.get("fast")))]
+    q = load_json(QUEUE, [])
+    added = [x for x in shas if x not in q]
+    save_json(QUEUE, q + added)
+    return len(added)
+
+
+def add_topic(name):
+    t = topics()
+    if name and name not in t:
+        t.insert(len(t) - 1 if t[-1] == OTHER else len(t), name)
+        save_json(TOPICS, t)
+    return t
+
+
 def ask(model, path, topic_list, host=OLLAMA):
     body = {
         "model": model, "stream": False, "think": False, "keep_alive": "30m",
         "format": schema(topic_list),
         "options": {"temperature": 0, "num_ctx": 6144},
         "messages": [  # инструкция в system: Ollama кеширует её между запросами, модель читает только картинку
-            {"role": "system", "content": PROMPT.format(topics=topic_lines(topic_list or DEFAULT_TOPICS))},
+            {"role": "system", "content": PROMPT.format(topics=topic_lines(topic_list or DEFAULT_TOPICS)) + hints_block()},
             {"role": "user", "images": [prep_image(path)], "content": "Разбери этот скриншот."}],
     }
     req = urllib.request.Request(host + "/api/chat", json.dumps(body).encode(),
@@ -601,32 +640,40 @@ def cmd_run(a):
     place()
 
 
-CONTACT_HINT = r"контакт|профил|звон|вызов|визитк|номер телефона|телефонн"
+CONTACT_HINT = "контакт, профил, звон, вызов, визитк, номер телефона, телефонн"
 
 
 def cmd_recheck(a):
-    """Заново разобрать быстрой моделью только скриншоты, где в прошлом ответе есть a.match (например, после новой темы)."""
+    """Поставить в очередь и заново разобрать скриншоты, где в прошлом ответе есть одно из слов a.match."""
+    if a.add_topic and not a.dry_run:
+        add_topic(a.add_topic)
+    pat = words_pattern(a.match)
+    if a.dry_run:
+        print("Подходит:", sum(1 for r in load_results().values() if pat.search(answer_text(r.get("fast")))))
+        return
+    print("В очередь добавлено:", queue_matching(pat))
+    if not a.queue_only:
+        process_queue()
+
+
+def process_queue():
     ensure_ollama()
-    topic_list = topics()
-    if a.add_topic and a.add_topic not in topic_list and not a.dry_run:
-        topic_list.insert(len(topic_list) - 1 if topic_list[-1] == OTHER else len(topic_list), a.add_topic)
-        save_json(TOPICS, topic_list)
-        print("Добавлена тема:", a.add_topic)
     res, by = load_results(), dict(index_sources())
-    pat = re.compile(a.match, re.I)
-    todo = []
-    for sha, r in res.items():
-        f = r.get("fast")
-        text = " ".join([f.get(k, "") for k in ("app", "seen", "title", "description")] + f.get("keywords", [])) if f else ""
-        if sha in by and pat.search(text):
-            todo.append((sha, by[sha]))
-    print(f"Под перепроверку: {len(todo)} из {len(res)}")
-    if todo and not a.dry_run:
-        analyze(todo, FAST, "fast", topic_list)
-        for sha, _ in todo:  # старая перепроверка сильной моделью относилась к прежнему ответу
-            if res[sha].get("strong"):
-                append_result({"sha": sha, "src": res[sha]["src"], "strong": None})
+    todo = [(sha, by[sha]) for sha in load_json(QUEUE, []) if sha in by]
+    print(f"Перепроверка: {len(todo)}")
+    if todo:
+        analyze(todo, FAST, "fast", topics())
+        for sha, _ in todo:
+            recheck_done(sha, res.get(sha, {}))
         place()
+
+
+def recheck_done(sha, r):
+    """Скриншот разобран заново: убрать из очереди и сбросить старую перепроверку сильной моделью."""
+    if r.get("strong"):
+        append_result({"sha": sha, "src": r["src"], "strong": None})
+    with _lock:
+        save_json(QUEUE, [x for x in load_json(QUEUE, []) if x != sha])
 
 
 def cmd_place(_):
@@ -653,7 +700,8 @@ def main():
     r.set_defaults(f=cmd_run)
     sub.add_parser("place").set_defaults(f=cmd_place)
     rc = sub.add_parser("recheck", help="перепроверить часть скриншотов (по умолчанию — похожие на контакты)")
-    rc.add_argument("--match", default=CONTACT_HINT, help="регулярное выражение по прошлому ответу модели")
+    rc.add_argument("--match", default=CONTACT_HINT, help="слова через запятую, которые ищем в прошлом ответе модели")
+    rc.add_argument("--queue-only", action="store_true", help="только поставить в очередь (разберёт приложение)")
     rc.add_argument("--add-topic", default="Контакты и звонки", help="добавить тему, если её ещё нет ('' — не добавлять)")
     rc.add_argument("--dry-run", action="store_true", help="только посчитать")
     rc.set_defaults(f=cmd_recheck)

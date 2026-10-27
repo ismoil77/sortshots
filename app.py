@@ -67,6 +67,7 @@ class Worker:
                 "errors": list(self.errors)[::-1],
                 "root": str(S.ROOT), "topics": topics,
                 "settings": S.load_json(SETTINGS, {"strong": True}),
+                "queue": len(S.load_json(S.QUEUE, [])), "hints": S.load_json(S.HINTS, []),
             }
 
     def speed(self, stage):
@@ -213,9 +214,9 @@ class Worker:
                     if r["sha"] in placed:
                         r["file"] = Path(placed[r["sha"]]).relative_to(S.ROOT).as_posix()
 
-    def run_pass(self, todo, model, stage, topics, workers):
+    def run_pass(self, todo, model, stage, topics, workers, label=None, after=None):
         self.phase = stage
-        self.msg = f"{STAGE_NAMES[stage]}: {len(todo)} шт."
+        self.msg = f"{label or STAGE_NAMES[stage]}: {len(todo)} шт."
         self.stats[stage] = {"times": deque(maxlen=20), "workers": workers}
         it, it_lock = iter(todo), threading.Lock()
 
@@ -241,6 +242,8 @@ class Worker:
                                             "title": fin["title"], "conf": round(out["confidence"], 2),
                                             "secs": round(time.time() - t0, 1)})
                     self.stats[stage]["times"].append(time.time() - t0)
+                    if after:
+                        after(sha)
                     self.place()
                 except Exception as e:  # битый файл или сбой модели: записываем и идём дальше
                     self.errors.append(f"{p.name}: {e}")
@@ -274,6 +277,11 @@ class Worker:
             self.by = dict(S.index_sources())
             if not self.by:
                 raise RuntimeError("Скриншотов нет: выбери папку или скопируй их с телефона")
+            queue = [(s, self.by[s]) for s in S.load_json(S.QUEUE, []) if s in self.by]
+            if queue:  # сначала то, что надо разобрать заново по новым подсказкам или темам
+                self.run_pass(queue, S.FAST, "fast", topics, 1, label="перепроверка по подсказкам", after=self.requeued)
+                if self.stop.is_set():
+                    return
             todo = [(s, p) for s, p in self.by.items() if "fast" not in self.res.get(s, {})]
             self.run_pass(todo, S.FAST, "fast", topics, 1)  # на 6 ГБ видеокарты параллельно только медленнее
             if self.stop.is_set():
@@ -301,6 +309,32 @@ class Worker:
                 self.place(force=True)
                 self.phase, self.msg = "idle", "Остановлено. Продолжить можно в любой момент."
             self.current.clear()
+
+    def requeued(self, sha):
+        r = self.res.get(sha, {})
+        S.recheck_done(sha, r)
+        r["strong"] = None
+
+    # ---- подсказки ----
+
+    def add_hint(self, text, topic, words, sha):
+        hints = S.load_json(S.HINTS, [])
+        hint = {"id": int(time.time() * 1000), "text": text.strip(), "topic": topic or "", "words": words.strip(),
+                "sha": sha or "", "created": time.strftime("%Y-%m-%d %H:%M")}
+        S.save_json(S.HINTS, hints + [hint])
+        if topic and topic != S.CHECK:  # новая папка из подсказки сразу становится темой
+            S.add_topic(topic)
+        if sha and topic:
+            self.set_topic(sha, topic)
+        queued = 0
+        pat = S.words_pattern(words)
+        if pat:
+            with self.lock:
+                queued = S.queue_matching(pat, self.res, skip={sha})
+        return {"ok": True, "queued": queued}
+
+    def delete_hint(self, hid):
+        S.save_json(S.HINTS, [h for h in S.load_json(S.HINTS, []) if h["id"] != hid])
 
     def start(self, source=None):
         if self.thread and self.thread.is_alive():
@@ -402,6 +436,13 @@ class H(BaseHTTPRequestHandler):
             if S.WIN and W.setup.get("ollama") in ("нет", "ошибка"):
                 threading.Thread(target=W.install_ollama, daemon=True).start()
             return self.send({"ok": S.WIN})
+        if p == "/api/hints":
+            if not (body.get("text") or "").strip():
+                return self.send({"ok": False, "error": "пустая подсказка"}, code=400)
+            return self.send(W.add_hint(body["text"], body.get("topic"), body.get("words") or "", body.get("sha")))
+        if p == "/api/hints/delete":
+            W.delete_hint(body.get("id"))
+            return self.send({"ok": True})
         if p == "/api/pull":
             if body.get("model") in (S.FAST, S.STRONG):
                 W.start_pull(body["model"])
