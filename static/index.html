@@ -67,6 +67,12 @@
   .card.moved { opacity: .45; }
   .zoom img { max-width: 94vw; max-height: 90vh; }
   textarea.topics { min-height: 340px; font-family: ui-monospace, monospace; font-size: .85rem; }
+  .crop { position: relative; display: inline-block; touch-action: none; user-select: none; cursor: crosshair; }
+  .crop img { display: block; max-width: 100%; max-height: 60vh; border-radius: 8px; pointer-events: none; }
+  .crop .box { position: absolute; border: 2px solid var(--pico-primary); background: color-mix(in srgb, var(--pico-primary) 15%, transparent);
+               box-shadow: 0 0 0 9999px rgba(0, 0, 0, .35); border-radius: 3px; }
+  .hint-grid { display: grid; grid-template-columns: minmax(160px, 260px) 1fr; gap: 1.2rem; align-items: start; }
+  @media (max-width: 640px) { .hint-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -114,7 +120,10 @@
           <span>Осталось примерно: <b x-text="eta()"></b></span>
           <span>Скорость: <b x-text="speed()"></b></span>
           <span>Перепроверено: <b x-text="s.strong_done + ' из ' + s.strong_need"></b></span>
-          <span x-show="s.queue">Ждут перепроверки по подсказкам: <b x-text="s.queue"></b></span>
+          <span x-show="s.queue">Ждут перепроверки по подсказкам: <b x-text="s.queue"></b>
+            <a href="#" @click.prevent="confirm('Убрать всё из очереди перепроверки? Уже сделанное останется.') && post('/api/queue/clear')">убрать</a></span>
+          <a href="#" x-show="s.fast_done" @click.prevent="redoAll()"
+             title="После обучения: разобрать заново все уже разобранные скриншоты с учётом подсказок и образцов">Переразобрать всё по обучению</a>
         </div>
         <template x-if="s.strong_need">
           <div style="margin-top:.6rem">
@@ -259,20 +268,33 @@
   </dialog>
 
   <dialog :open="hint.open" @keydown.escape.window="hint.open && closeHint()">
-    <article style="width:min(640px,96vw)">
+    <article style="width:min(980px,96vw)">
       <header><strong>Исправить или научить</strong></header>
-      <div style="display:grid;grid-template-columns:120px 1fr;gap:1rem;align-items:start">
-        <img :src="hint.sha ? '/img/' + hint.sha + '?w=240' : ''" alt="" style="width:120px;border-radius:8px">
-        <div>
-          <span class="muted" x-text="'Сейчас: ' + hint.title"></span>
-          <p x-show="hint.paused" style="margin:.4rem 0 0;font-size:.85rem">⏸ Разбор на паузе, пока ты пишешь. Продолжится, когда закроешь это окно.</p>
+      <div class="hint-grid">
+      <div>
+        <div class="crop" x-show="hint.mode !== 'one'" @pointerdown="cropStart($event)" @pointermove="cropMove($event)" @pointerup="cropEnd()" @pointercancel="cropEnd()">
+          <img :src="hint.sha ? '/img/' + hint.sha + '?w=720' : ''" alt="" draggable="false">
+          <div class="box" x-show="hint.box" :style="boxStyle()"></div>
         </div>
+        <img x-show="hint.mode === 'one'" :src="hint.sha ? '/img/' + hint.sha + '?w=720' : ''" alt="" style="max-width:100%;max-height:60vh;border-radius:8px">
+        <small class="muted" x-show="hint.mode !== 'one'" style="display:block;margin-top:.3rem"
+               x-text="hint.box ? 'Выделено. Обвести заново — просто веди мышкой ещё раз.' : 'Можно обвести мышкой часть картинки, на которую смотреть.'"></small>
+        <a href="#" x-show="hint.box" @click.prevent="hint.box = null" style="font-size:.85rem">убрать выделение</a>
       </div>
+      <div>
+      <span class="muted" x-text="'Сейчас: ' + hint.title"></span>
+      <p x-show="hint.paused" style="margin:.4rem 0 0;font-size:.85rem">⏸ Разбор на паузе, пока ты пишешь. Продолжится, когда закроешь это окно.</p>
       <fieldset style="margin-top:1rem">
-        <label><input type="radio" value="one" x-model="hint.mode"> Только этот скриншот <small class="muted" style="display:block;margin:.15rem 0 .5rem 1.9rem">поправить папку и название, нейросеть ничего не запоминает</small></label>
-        <label><input type="radio" value="all" x-model="hint.mode"> Запомнить для всех (обучение) <small class="muted" style="display:block;margin:.15rem 0 0 1.9rem">правило попадёт в инструкцию нейросети</small></label>
+        <label><input type="radio" value="one" x-model="hint.mode"> Поправлю сам <small class="muted" style="display:block;margin:.15rem 0 .5rem 1.9rem">сам выберу папку и название этого скриншота</small></label>
+        <label><input type="radio" value="redo" x-model="hint.mode"> Неверно — переразбери этот <small class="muted" style="display:block;margin:.15rem 0 .5rem 1.9rem">напишу, что тут на самом деле, нейросеть разберёт его заново первым</small></label>
+        <label><input type="radio" value="all" x-model="hint.mode"> Запомнить для всех (обучение) <small class="muted" style="display:block;margin:.15rem 0 0 1.9rem">правило и выделенный кусок станут образцом для всех скриншотов</small></label>
       </fieldset>
-      <label>Название файла
+      <template x-if="hint.mode === 'redo'">
+        <label>Что на скриншоте на самом деле
+          <textarea x-model="hint.text" rows="3" placeholder="Например: это не переписка, а карточка контакта Алишера с номером телефона."></textarea>
+        </label>
+      </template>
+      <label x-show="hint.mode !== 'redo'">Название файла
         <input x-model="hint.newTitle" :placeholder="hint.title">
       </label>
       <div class="grid">
@@ -293,11 +315,13 @@
           </label>
           <label>Найти похожие среди уже разобранных по словам
             <input x-model="hint.words" placeholder="через запятую: контакт, номер телефона">
-            <small class="muted">Найденные встанут в очередь и разберутся заново первыми при следующем запуске.</small>
+            <small class="muted">Найденные встанут в очередь и разберутся заново первыми.</small>
           </label>
         </div>
       </template>
       <p x-show="hint.result" x-text="hint.result"></p>
+      </div>
+      </div>
       <footer>
         <button class="secondary" @click="closeHint()" x-text="hint.result ? 'Закрыть' : 'Отмена'"></button>
         <button @click="saveHint()" :disabled="!!hint.result || !canSaveHint()">Сохранить</button>
@@ -311,9 +335,10 @@
       <p class="muted" x-show="!s.hints.length">Пока пусто. Открой папку, найди скриншот, который лежит не там, и нажми «Подсказать».</p>
       <template x-for="h in s.hints" :key="h.id">
         <div style="display:flex;gap:.8rem;align-items:start;padding:.5rem 0;border-bottom:1px solid var(--pico-muted-border-color)">
-          <img x-show="h.sha" :src="'/img/' + h.sha + '?w=120'" alt="" style="width:44px;border-radius:5px">
+          <img x-show="h.crop" :src="h.crop ? '/' + h.crop : ''" alt="" style="width:88px;border-radius:5px" title="образец">
+          <img x-show="h.sha && !h.crop" :src="'/img/' + h.sha + '?w=120'" alt="" style="width:44px;border-radius:5px">
           <div style="flex:1">
-            <div x-text="h.text"></div>
+            <div x-text="h.text || 'образец без текста'"></div>
             <small class="muted" x-text="(h.topic ? '→ ' + h.topic + ' · ' : '') + (h.words ? 'похожие: ' + h.words + ' · ' : '') + h.created"></small>
           </div>
           <button class="secondary outline" style="width:auto;margin:0;padding:.2rem .6rem" @click="post('/api/hints/delete', {id: h.id})">Удалить</button>
@@ -408,9 +433,42 @@ function app() {
     async openHint(f) {
       // разбор ждёт, пока пишется подсказка: иначе следующие скриншоты уйдут без неё
       const pause = this.s.running && !this.s.paused;
-      this.hint = { open: true, sha: f.sha, title: f.title, newTitle: '', mode: 'one', text: '', topic: '', newTopic: '',
-                    words: '', result: '', paused: pause };
+      this.hint = { open: true, sha: f.sha, title: f.title, newTitle: '', mode: 'redo', text: '', topic: '', newTopic: '',
+                    words: '', result: '', paused: pause, box: null, drag: null };
       if (pause) await this.post('/api/pause');
+    },
+    // выделение части картинки: координаты в долях от 0 до 1, чтобы не зависеть от размера превью
+    cropPoint(e) {
+      const r = e.currentTarget.getBoundingClientRect();
+      return [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))];
+    },
+    cropStart(e) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+      const [x, y] = this.cropPoint(e);
+      this.hint.drag = [x, y];
+      this.hint.box = [x, y, 0, 0];
+    },
+    cropMove(e) {
+      if (!this.hint.drag) return;
+      const [x0, y0] = this.hint.drag, [x, y] = this.cropPoint(e);
+      this.hint.box = [Math.min(x0, x), Math.min(y0, y), Math.abs(x - x0), Math.abs(y - y0)];
+    },
+    cropEnd() {
+      this.hint.drag = null;
+      const b = this.hint.box;
+      if (b && (b[2] < 0.02 || b[3] < 0.02)) this.hint.box = null;  // просто клик, а не выделение
+    },
+    boxStyle() {
+      const b = this.hint.box || [0, 0, 0, 0];
+      return `left:${b[0] * 100}%;top:${b[1] * 100}%;width:${b[2] * 100}%;height:${b[3] * 100}%`;
+    },
+    async redoAll() {
+      const n = this.s.fast_done, min = Math.round(n * (this.s.speed.fast || 5.7) / 60);
+      const time = min < 60 ? min + ' мин' : Math.floor(min / 60) + ' ч ' + (min % 60) + ' мин';
+      if (!confirm(`Разобрать заново все ${n} скриншотов с учётом подсказок и образцов? Это примерно ${time}. ` +
+                   'Ручные исправления останутся. Разбор начнётся, когда нажмёшь «Продолжить разбор».')) return;
+      const r = await (await fetch('/api/redo-all', { method: 'POST' })).json();
+      alert('В очередь добавлено: ' + r.queued);
     },
     async closeHint() {
       const resume = this.hint.paused;
@@ -419,14 +477,19 @@ function app() {
     },
     canSaveHint() {
       const h = this.hint;
-      return h.mode === 'all' ? !!h.text.trim() : !!(h.newTitle.trim() || h.topic || h.newTopic.trim());
+      if (h.mode === 'all') return !!(h.text.trim() || h.box);
+      if (h.mode === 'redo') return !!(h.text.trim() || h.topic || h.newTopic.trim());
+      return !!(h.newTitle.trim() || h.topic || h.newTopic.trim());
     },
     async saveHint() {
       const h = this.hint;
       const r = await (await fetch('/api/hints', { method: 'POST', body: JSON.stringify({
-        mode: h.mode, sha: h.sha, text: h.text, title: h.newTitle.trim(), topic: h.newTopic.trim() || h.topic, words: h.words }) })).json();
+        mode: h.mode, sha: h.sha, text: h.text, title: h.mode === 'redo' ? '' : h.newTitle.trim(),
+        topic: h.newTopic.trim() || h.topic, words: h.words, box: h.mode === 'one' ? null : h.box }) })).json();
       h.result = !r.ok ? 'Не сохранилось: ' + r.error
         : h.mode === 'one' ? 'Исправлено.'
+        : h.mode === 'redo' ? (r.running ? 'Принято: этот скриншот разберётся следующим.'
+                                         : 'Принято: разберётся первым, когда нажмёшь «Продолжить разбор».')
         : 'Запомнено: будет учтено со следующего скриншота.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '');
       if (r.ok && this.folder.open) this.openFolder(this.folder.path);
     },

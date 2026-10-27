@@ -37,6 +37,7 @@ class Worker:
         self.res = S.load_results()
         self.by = dict(S.index_sources()) if S.SRC.exists() else {}
         self.last_place = 0
+        self.skip = set()  # не разобрались из-за ошибки в этом запуске
         threading.Thread(target=self.check_models, daemon=True).start()
 
     # ---- состояние для страницы ----
@@ -77,7 +78,7 @@ class Worker:
         return sum(st["times"]) / len(st["times"]) / st["workers"]  # секунд на скриншот с учётом параллельности
 
     def eta(self, fast_done, strong_need, strong_done):
-        left_fast = len(self.by) - fast_done
+        left_fast = len(self.by) - fast_done + len(S.load_json(S.QUEUE, []))
         minutes = left_fast * (self.speed("fast") or 4.0)
         if S.load_json(SETTINGS, {"strong": True})["strong"]:
             share = strong_need / fast_done if fast_done else 0.3  # какая доля уйдёт на перепроверку
@@ -214,9 +215,28 @@ class Worker:
                     if r["sha"] in placed:
                         r["file"] = Path(placed[r["sha"]]).relative_to(S.ROOT).as_posix()
 
+    def fast_todo(self):
+        """Сначала очередь перепроверки (её пополняют прямо во время разбора), потом ещё не разобранные."""
+        while not self.stop.is_set():
+            queue = [s for s in S.load_json(S.QUEUE, []) if s in self.by]
+            sha = queue[0] if queue else next(
+                (s for s in self.by if s not in self.skip and "fast" not in self.res.get(s, {})), None)
+            if not sha:
+                return
+            self.msg = (f"перепроверка по подсказкам: в очереди {len(queue)}" if queue
+                        else f"{STAGE_NAMES['fast']}: осталось {len(self.by) - len(self.res)}")
+            yield sha, self.by[sha]
+
+    def failed(self, sha):
+        """Битый файл не крутим по кругу: убираем из очереди и пропускаем до следующего запуска."""
+        self.skip.add(sha)
+        with S._lock:
+            S.save_json(S.QUEUE, [x for x in S.load_json(S.QUEUE, []) if x != sha])
+
     def run_pass(self, todo, model, stage, topics, workers, label=None, after=None):
         self.phase = stage
-        self.msg = f"{label or STAGE_NAMES[stage]}: {len(todo)} шт."
+        if isinstance(todo, list):
+            self.msg = f"{label or STAGE_NAMES[stage]}: {len(todo)} шт."
         self.stats[stage] = {"times": deque(maxlen=20), "workers": workers}
         it, it_lock = iter(todo), threading.Lock()
 
@@ -231,8 +251,9 @@ class Worker:
                 sha, p = nxt
                 self.current[sha] = {"name": p.name, "stage": stage, "since": time.time()}
                 t0 = time.time()
+                topics = S.topics()  # новая папка из подсказки доступна модели сразу
                 try:
-                    out = S.ask(model, p, topics)
+                    out = S.ask(model, p, topics, sha=sha)
                     S.append_result({"sha": sha, "src": p.relative_to(S.SRC).as_posix(), stage: out})
                     with self.lock:
                         r = self.res.setdefault(sha, {"sha": sha, "src": p.relative_to(S.SRC).as_posix()})
@@ -247,6 +268,7 @@ class Worker:
                     self.place()
                 except Exception as e:  # битый файл или сбой модели: записываем и идём дальше
                     self.errors.append(f"{p.name}: {e}")
+                    self.failed(sha)
                 finally:
                     self.current.pop(sha, None)
 
@@ -277,26 +299,28 @@ class Worker:
             self.by = dict(S.index_sources())
             if not self.by:
                 raise RuntimeError("Скриншотов нет: выбери папку или скопируй их с телефона")
-            queue = [(s, self.by[s]) for s in S.load_json(S.QUEUE, []) if s in self.by]
-            if queue:  # сначала то, что надо разобрать заново по новым подсказкам или темам
-                self.run_pass(queue, S.FAST, "fast", topics, 1, label="перепроверка по подсказкам", after=self.requeued)
+            self.skip = set()
+            while True:
+                # на 6 ГБ видеокарты параллельно только медленнее; очередь по подсказкам идёт первой
+                self.run_pass(self.fast_todo(), S.FAST, "fast", topics, 1, after=self.requeued)
                 if self.stop.is_set():
                     return
-            todo = [(s, p) for s, p in self.by.items() if "fast" not in self.res.get(s, {})]
-            self.run_pass(todo, S.FAST, "fast", topics, 1)  # на 6 ГБ видеокарты параллельно только медленнее
-            if self.stop.is_set():
-                return
-            self.place(force=True)
-            if not S.load_json(SETTINGS, {"strong": True})["strong"]:
-                self.phase, self.msg = "done", "Готово (без перепроверки сильной моделью)."
-                return
-            if self.models.get(S.STRONG, {}).get("status") != "готова":
-                self.phase, self.msg = "models", "Жду, пока докачается сильная модель"
-                strong.join()
-            todo = [(s, self.by[s]) for s, r in list(self.res.items()) if s in self.by and S.needs_strong(r, topics)]
-            self.run_pass(todo, S.STRONG, "strong", topics, 1)
-            if self.stop.is_set():
-                return
+                self.place(force=True)
+                if not S.load_json(SETTINGS, {"strong": True})["strong"]:
+                    if self.queue_left():
+                        continue
+                    self.phase, self.msg = "done", "Готово (без перепроверки сильной моделью)."
+                    return
+                if self.models.get(S.STRONG, {}).get("status") != "готова":
+                    self.phase, self.msg = "models", "Жду, пока докачается сильная модель"
+                    strong.join()
+                topics = S.topics()
+                todo = [(s, self.by[s]) for s, r in list(self.res.items()) if s in self.by and S.needs_strong(r, topics)]
+                self.run_pass(todo, S.STRONG, "strong", topics, 1)
+                if self.stop.is_set():
+                    return
+                if not self.queue_left():  # пока шла сильная модель, могли попросить переразобрать
+                    break
             self.phase, self.msg = "place", "Раскладываю по папкам"
             self.place(force=True)
             self.phase, self.msg = "done", "Готово. Загляни в папку «Проверить»."
@@ -310,6 +334,9 @@ class Worker:
                 self.phase, self.msg = "idle", "Остановлено. Продолжить можно в любой момент."
             self.current.clear()
 
+    def queue_left(self):
+        return any(s in self.by for s in S.load_json(S.QUEUE, []))
+
     def requeued(self, sha):
         r = self.res.get(sha, {})
         S.recheck_done(sha, r)
@@ -317,18 +344,23 @@ class Worker:
 
     # ---- подсказки ----
 
-    def add_hint(self, text, topic, words, sha, title=None, remember=True):
-        """remember=False — исправить только этот скриншот; True — ещё и запомнить правило для всех следующих."""
+    def add_hint(self, mode, text, topic, words, sha, title=None, box=None):
+        """mode: one — поправить только этот скриншот вручную; redo — переразобрать его с комментарием;
+        all — запомнить правило (и образец, если выделена часть картинки) для всех следующих."""
         if topic and topic != S.CHECK:  # новая папка сразу становится темой
             S.add_topic(topic)
+        if mode == "redo":
+            return self.redo_one(sha, text, topic, box)
         if sha and (topic or title):
             self.set_topic(sha, topic, title)
-        if not remember:
+        if mode == "one":
             return {"ok": True, "queued": 0}
-        hints = S.load_json(S.HINTS, [])
-        hint = {"id": int(time.time() * 1000), "text": text.strip(), "topic": topic or "", "words": words.strip(),
+        hid = int(time.time() * 1000)
+        hint = {"id": hid, "text": text.strip(), "topic": topic or "", "words": words.strip(),
                 "sha": sha or "", "created": time.strftime("%Y-%m-%d %H:%M")}
-        S.save_json(S.HINTS, hints + [hint])
+        if box and sha in self.by:
+            hint["crop"] = S.save_crop(self.by[sha], box, f"hint_{hid}")
+        S.save_json(S.HINTS, S.load_json(S.HINTS, []) + [hint])
         queued = 0
         pat = S.words_pattern(words)
         if pat:
@@ -336,8 +368,34 @@ class Worker:
                 queued = S.queue_matching(pat, self.res, skip={sha})
         return {"ok": True, "queued": queued}
 
+    def redo_one(self, sha, text, topic, box):
+        """Переразобрать один скриншот с комментарием владельца: он встаёт в очередь первым."""
+        if sha not in self.by:
+            return {"ok": False, "error": "скриншот не найден"}
+        note = {"text": text.strip() + (f" Правильная папка: «{topic}»." if topic else "")}
+        if box:
+            note["crop"] = S.save_crop(self.by[sha], box, f"note_{sha[:16]}")
+        notes = S.load_json(S.NOTES, {})
+        notes[sha] = note
+        S.save_json(S.NOTES, notes)
+        ov = S.load_json(S.OVERRIDES, {})
+        if ov.pop(sha, None) is not None:  # прошлое ручное исправление больше не держит скриншот на месте
+            S.save_json(S.OVERRIDES, ov)
+        S.queue_add([sha], front=True)
+        return {"ok": True, "queued": 1, "running": bool(self.thread and self.thread.is_alive())}
+
+    def redo_all(self):
+        """После обучения: заново разобрать всё, что уже разобрано. Ручные исправления остаются."""
+        with self.lock:
+            done = [s for s in self.by if "fast" in self.res.get(s, {})]
+        return S.queue_add(done)
+
     def delete_hint(self, hid):
-        S.save_json(S.HINTS, [h for h in S.load_json(S.HINTS, []) if h["id"] != hid])
+        hints = S.load_json(S.HINTS, [])
+        for h in hints:
+            if h["id"] == hid and h.get("crop"):
+                (S.DATA / h["crop"]).unlink(missing_ok=True)
+        S.save_json(S.HINTS, [h for h in hints if h["id"] != hid])
 
     def start(self, source=None):
         if self.thread and self.thread.is_alive():
@@ -417,6 +475,11 @@ class H(BaseHTTPRequestHandler):
         if u.path.startswith("/img/"):
             body = thumb(u.path[5:], int(q.get("w", 320)))
             return self.send(body, "image/jpeg") if body else self.send_error(404)
+        if u.path.startswith("/examples/"):
+            f = (S.EXAMPLES / u.path[10:]).resolve()
+            if f.parent != S.EXAMPLES.resolve() or not f.exists():
+                return self.send_error(404)
+            return self.send(f.read_bytes(), "image/jpeg")
         if u.path == "/api/folder":
             return self.send(W.folder(q.get("path", "")))
         if u.path == "/api/events":
@@ -447,11 +510,23 @@ class H(BaseHTTPRequestHandler):
                 threading.Thread(target=W.install_ollama, daemon=True).start()
             return self.send({"ok": S.WIN})
         if p == "/api/hints":
-            remember = body.get("mode") != "one"
-            if remember and not (body.get("text") or "").strip():
+            mode = body.get("mode") if body.get("mode") in ("one", "redo") else "all"
+            box = body.get("box")
+            if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)
+                    and box[2] > 0.01 and box[3] > 0.01):
+                box = None  # случайный клик вместо выделения
+            if mode == "all" and not ((body.get("text") or "").strip() or box):
                 return self.send({"ok": False, "error": "напиши, что запомнить"}, code=400)
-            return self.send(W.add_hint(body.get("text") or "", body.get("topic"), body.get("words") or "",
-                                        body.get("sha"), body.get("title"), remember))
+            if mode == "redo" and not ((body.get("text") or "").strip() or body.get("topic")):
+                return self.send({"ok": False, "error": "напиши, что на скриншоте на самом деле"}, code=400)
+            return self.send(W.add_hint(mode, body.get("text") or "", body.get("topic"), body.get("words") or "",
+                                        body.get("sha"), body.get("title"), box))
+        if p == "/api/redo-all":
+            return self.send({"ok": True, "queued": W.redo_all()})
+        if p == "/api/queue/clear":
+            with S._lock:
+                S.save_json(S.QUEUE, [])
+            return self.send({"ok": True})
         if p == "/api/hints/delete":
             W.delete_hint(body.get("id"))
             return self.send({"ok": True})

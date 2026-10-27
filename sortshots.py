@@ -26,6 +26,10 @@ OVERRIDES = DATA / "overrides.json"
 PLACED = DATA / "placed.json"
 HINTS = DATA / "hints.json"            # подсказки владельца: попадают в инструкцию модели
 QUEUE = DATA / "recheck_queue.json"    # уже разобранные скриншоты, которые надо разобрать заново
+NOTES = DATA / "notes.json"            # комментарии владельца к отдельным скриншотам: «это не то, а вот что»
+EXAMPLES = DATA / "examples"           # вырезанные куски скриншотов — образцы для обучения
+MAX_EXAMPLES = 6   # больше образцов не влезет в контекст рядом со скриншотом
+CROP_SIDE = 384    # образец до 384 px: около 150 токенов, читается и не раздувает запрос
 
 WIN = sys.platform == "win32"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if WIN else 0  # на Windows не мигать чёрными окнами консоли
@@ -306,8 +310,46 @@ def prep_image(path):
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def crop_hints():
+    """Подсказки с выделенным куском скриншота: модель видит их как картинки-образцы."""
+    return [h for h in load_json(HINTS, []) if h.get("crop") and (DATA / h["crop"]).exists()][-MAX_EXAMPLES:]
+
+
+def save_crop(path, box, name):
+    """Вырезать часть скриншота (box — доли от 0 до 1: x, y, ширина, высота) в образец. Вернёт путь от DATA."""
+    x, y, w, h = (max(0.0, min(1.0, float(v))) for v in box)
+    EXAMPLES.mkdir(parents=True, exist_ok=True)
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        iw, ih = im.size
+        left, top = int(x * iw), int(y * ih)
+        part = im.crop((left, top, max(left + 1, min(iw, int((x + w) * iw))), max(top + 1, min(ih, int((y + h) * ih)))))
+        part.thumbnail((CROP_SIDE, CROP_SIDE))
+        out = EXAMPLES / f"{name}.jpg"
+        part.save(out, "JPEG", quality=88)
+    return out.relative_to(DATA).as_posix()
+
+
+def b64_file(path):
+    return base64.b64encode(Path(path).read_bytes()).decode()
+
+
+def examples_messages():
+    """Образцы идут отдельной парой сообщений перед скриншотом: префикс одинаковый, Ollama его кеширует."""
+    ex = crop_hints()
+    if not ex:
+        return []
+    lines = [f"Картинка {i}: {h['text'] or 'пример'}" + (f" → тема «{h['topic']}»" if h.get("topic") else "")
+             for i, h in enumerate(ex, 1)]
+    return [{"role": "user", "images": [b64_file(DATA / h["crop"]) for h in ex],
+             "content": "Это куски скриншотов, которые выделил владелец, и что они значат:\n" + "\n".join(lines)
+                        + "\nЕсли на скриншоте есть похожее (тот же интерфейс, значок, форма), применяй это правило."},
+            {"role": "assistant", "content": "Понял, буду сверять скриншоты с этими образцами."}]
+
+
 def hints_block():
-    hints = load_json(HINTS, [])
+    with_crop = {h["id"] for h in crop_hints()}
+    hints = [h for h in load_json(HINTS, []) if h["id"] not in with_crop]  # подсказки с образцом уже в картинках
     if not hints:
         return ""
     lines = [f"- {h['text']}" + (f" → тема «{h['topic']}»" if h.get("topic") else "") for h in hints]
@@ -328,11 +370,20 @@ def words_pattern(words):
 def queue_matching(pattern, res=None, skip=()):
     """Поставить в очередь перепроверки разобранные скриншоты, чей ответ подходит под pattern. Вернёт сколько."""
     res = res if res is not None else load_results()
-    shas = [sha for sha, r in res.items() if sha not in skip and pattern.search(answer_text(r.get("fast")))]
-    q = load_json(QUEUE, [])
-    added = [x for x in shas if x not in q]
-    save_json(QUEUE, q + added)
-    return len(added)
+    return queue_add([sha for sha, r in res.items() if sha not in skip and pattern.search(answer_text(r.get("fast")))])
+
+
+def queue_add(shas, front=False):
+    """Добавить в очередь перепроверки; front — разобрать раньше всех остальных. Вернёт сколько новых."""
+    with _lock:
+        q, new = load_json(QUEUE, []), list(dict.fromkeys(shas))
+        old, first = set(q), set(new)
+        if front:
+            save_json(QUEUE, new + [x for x in q if x not in first])
+            return len(first - old)
+        added = [x for x in new if x not in old]
+        save_json(QUEUE, q + added)
+        return len(added)
 
 
 def add_topic(name):
@@ -343,14 +394,22 @@ def add_topic(name):
     return t
 
 
-def ask(model, path, topic_list, host=OLLAMA):
+def ask(model, path, topic_list, host=OLLAMA, sha=None):
+    user = {"role": "user", "images": [prep_image(path)], "content": "Разбери этот скриншот."}
+    note = load_json(NOTES, {}).get(sha) if sha else None
+    if note:
+        user["content"] += ("\n\nВладелец уже смотрел этот скриншот и сказал, что прошлый разбор неверный. "
+                            "Его комментарий важнее всего остального: " + (note.get("text") or "разбери внимательнее"))
+        if note.get("crop") and (DATA / note["crop"]).exists():
+            user["images"].append(b64_file(DATA / note["crop"]))
+            user["content"] += "\nВторая картинка — часть этого скриншота, на которую владелец просит обратить внимание."
     body = {
         "model": model, "stream": False, "think": False, "keep_alive": "30m",
         "format": schema(topic_list),
         "options": {"temperature": 0, "num_ctx": 6144},
         "messages": [  # инструкция в system: Ollama кеширует её между запросами, модель читает только картинку
             {"role": "system", "content": PROMPT.format(topics=topic_lines(topic_list or DEFAULT_TOPICS)) + hints_block()},
-            {"role": "user", "images": [prep_image(path)], "content": "Разбери этот скриншот."}],
+            *examples_messages(), user],
     }
     req = urllib.request.Request(host + "/api/chat", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
@@ -363,7 +422,7 @@ def ask(model, path, topic_list, host=OLLAMA):
 def analyze(items, model, stage, topic_list, workers=1):
     done, total, t0 = 0, len(items), time.time()
     with ThreadPoolExecutor(workers) as pool:
-        futs = {pool.submit(ask, model, p, topic_list): (sha, p) for sha, p in items}
+        futs = {pool.submit(ask, model, p, topic_list, sha=sha): (sha, p) for sha, p in items}
         for fut in as_completed(futs):
             sha, p = futs[fut]
             done += 1
