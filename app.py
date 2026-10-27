@@ -317,15 +317,18 @@ class Worker:
 
     # ---- подсказки ----
 
-    def add_hint(self, text, topic, words, sha):
+    def add_hint(self, text, topic, words, sha, title=None, remember=True):
+        """remember=False — исправить только этот скриншот; True — ещё и запомнить правило для всех следующих."""
+        if topic and topic != S.CHECK:  # новая папка сразу становится темой
+            S.add_topic(topic)
+        if sha and (topic or title):
+            self.set_topic(sha, topic, title)
+        if not remember:
+            return {"ok": True, "queued": 0}
         hints = S.load_json(S.HINTS, [])
         hint = {"id": int(time.time() * 1000), "text": text.strip(), "topic": topic or "", "words": words.strip(),
                 "sha": sha or "", "created": time.strftime("%Y-%m-%d %H:%M")}
         S.save_json(S.HINTS, hints + [hint])
-        if topic and topic != S.CHECK:  # новая папка из подсказки сразу становится темой
-            S.add_topic(topic)
-        if sha and topic:
-            self.set_topic(sha, topic)
         queued = 0
         pat = S.words_pattern(words)
         if pat:
@@ -356,9 +359,16 @@ class Worker:
                             "entities": f.get("entities", [])})
         return sorted(out, key=lambda x: x["file"])
 
-    def set_topic(self, sha, topic):
+    def set_topic(self, sha, topic=None, title=None):
+        """Ручное исправление одного скриншота: папка и/или название."""
         ov = S.load_json(S.OVERRIDES, {})
-        ov[sha] = topic
+        cur = ov.get(sha) or {}
+        cur = {"topic": cur} if isinstance(cur, str) else cur
+        if topic:
+            cur["topic"] = topic
+        if title:
+            cur["title"] = title.strip()
+        ov[sha] = cur
         S.save_json(S.OVERRIDES, ov)
         self.place(force=True)
 
@@ -437,9 +447,11 @@ class H(BaseHTTPRequestHandler):
                 threading.Thread(target=W.install_ollama, daemon=True).start()
             return self.send({"ok": S.WIN})
         if p == "/api/hints":
-            if not (body.get("text") or "").strip():
-                return self.send({"ok": False, "error": "пустая подсказка"}, code=400)
-            return self.send(W.add_hint(body["text"], body.get("topic"), body.get("words") or "", body.get("sha")))
+            remember = body.get("mode") != "one"
+            if remember and not (body.get("text") or "").strip():
+                return self.send({"ok": False, "error": "напиши, что запомнить"}, code=400)
+            return self.send(W.add_hint(body.get("text") or "", body.get("topic"), body.get("words") or "",
+                                        body.get("sha"), body.get("title"), remember))
         if p == "/api/hints/delete":
             W.delete_hint(body.get("id"))
             return self.send({"ok": True})

@@ -160,7 +160,11 @@
                   <span class="muted" x-text="r.stage === 'strong' ? ' перепроверен' : ''"></span>
                 </div>
               </div>
-              <div class="conf" :title="'уверенность модели'" x-text="Math.round(r.conf * 100) + '%'"></div>
+              <div style="display:flex;flex-direction:column;align-items:end;gap:.2rem">
+                <span class="conf" :title="'уверенность модели'" x-text="Math.round(r.conf * 100) + '%'"></span>
+                <button class="secondary outline" style="padding:.1rem .45rem;font-size:.75rem;margin:0;width:auto"
+                        @click.stop="openHint(r)">Подсказать</button>
+              </div>
             </div>
           </template>
         </div>
@@ -254,23 +258,27 @@
     <img :src="zoom ? '/img/' + zoom + '?w=1200' : ''" alt="">
   </dialog>
 
-  <dialog :open="hint.open" @keydown.escape.window="hint.open = false">
+  <dialog :open="hint.open" @keydown.escape.window="hint.open && closeHint()">
     <article style="width:min(640px,96vw)">
-      <header><strong>Подсказка для нейросети</strong></header>
+      <header><strong>Исправить или научить</strong></header>
       <div style="display:grid;grid-template-columns:120px 1fr;gap:1rem;align-items:start">
         <img :src="hint.sha ? '/img/' + hint.sha + '?w=240' : ''" alt="" style="width:120px;border-radius:8px">
         <div>
-          <p class="muted" style="margin:0 0 .4rem">Модель ничего не запоминает сама. Подсказка добавится в её инструкцию для всех следующих скриншотов.</p>
           <span class="muted" x-text="'Сейчас: ' + hint.title"></span>
+          <p x-show="hint.paused" style="margin:.4rem 0 0;font-size:.85rem">⏸ Разбор на паузе, пока ты пишешь. Продолжится, когда закроешь это окно.</p>
         </div>
       </div>
-      <label>Что здесь и как такое раскладывать
-        <textarea x-model="hint.text" rows="3" placeholder="Например: карточка контакта с номером из телефонной книги — это не переписка"></textarea>
+      <fieldset style="margin-top:1rem">
+        <label><input type="radio" value="one" x-model="hint.mode"> Только этот скриншот <small class="muted" style="display:block;margin:.15rem 0 .5rem 1.9rem">поправить папку и название, нейросеть ничего не запоминает</small></label>
+        <label><input type="radio" value="all" x-model="hint.mode"> Запомнить для всех (обучение) <small class="muted" style="display:block;margin:.15rem 0 0 1.9rem">правило попадёт в инструкцию нейросети</small></label>
+      </fieldset>
+      <label>Название файла
+        <input x-model="hint.newTitle" :placeholder="hint.title">
       </label>
       <div class="grid">
-        <label>Папка для таких
+        <label>Папка
           <select x-model="hint.topic">
-            <option value="">— не указывать —</option>
+            <option value="">— не менять —</option>
             <template x-for="t in allTopics()"><option :value="t" x-text="t"></option></template>
           </select>
         </label>
@@ -278,14 +286,21 @@
           <input x-model="hint.newTopic" placeholder="Например: Рецепты">
         </label>
       </div>
-      <label>Найти похожие среди уже разобранных по словам
-        <input x-model="hint.words" placeholder="через запятую: контакт, номер телефона">
-        <small class="muted">Нашлись — встанут в очередь и разберутся заново при следующем запуске разбора.</small>
-      </label>
+      <template x-if="hint.mode === 'all'">
+        <div>
+          <label>Что запомнить
+            <textarea x-model="hint.text" rows="3" placeholder="Например: карточка контакта с номером — это не переписка, а контакт. Или: «Вахдат» пишется так, а не «Вахдад»."></textarea>
+          </label>
+          <label>Найти похожие среди уже разобранных по словам
+            <input x-model="hint.words" placeholder="через запятую: контакт, номер телефона">
+            <small class="muted">Найденные встанут в очередь и разберутся заново первыми при следующем запуске.</small>
+          </label>
+        </div>
+      </template>
       <p x-show="hint.result" x-text="hint.result"></p>
       <footer>
-        <button class="secondary" @click="hint.open = false" x-text="hint.result ? 'Закрыть' : 'Отмена'"></button>
-        <button @click="saveHint()" :disabled="!hint.text.trim() || hint.result">Сохранить</button>
+        <button class="secondary" @click="closeHint()" x-text="hint.result ? 'Закрыть' : 'Отмена'"></button>
+        <button @click="saveHint()" :disabled="!!hint.result || !canSaveHint()">Сохранить</button>
       </footer>
     </article>
   </dialog>
@@ -329,7 +344,7 @@ function app() {
     folder: { open: false, path: '', items: [] },
     topics: { open: false, text: '' },
     zoom: null,
-    hint: { open: false, sha: '', title: '', text: '', topic: '', newTopic: '', words: '', result: '' },
+    hint: { open: false, sha: '', title: '', newTitle: '', mode: 'one', text: '', topic: '', newTopic: '', words: '', result: '', paused: false },
     hintsOpen: false,
     counts: {}, bumps: {},
     bumped(path) { return Date.now() - (this.bumps[path] || 0) < 1200; },
@@ -390,14 +405,29 @@ function app() {
       this.folder = { open: true, path, items: [] };
       this.folder.items = await (await fetch('/api/folder?path=' + encodeURIComponent(path))).json();
     },
-    openHint(f) {
-      this.hint = { open: true, sha: f.sha, title: f.title, text: '', topic: '', newTopic: '', words: '', result: '' };
+    async openHint(f) {
+      // разбор ждёт, пока пишется подсказка: иначе следующие скриншоты уйдут без неё
+      const pause = this.s.running && !this.s.paused;
+      this.hint = { open: true, sha: f.sha, title: f.title, newTitle: '', mode: 'one', text: '', topic: '', newTopic: '',
+                    words: '', result: '', paused: pause };
+      if (pause) await this.post('/api/pause');
+    },
+    async closeHint() {
+      const resume = this.hint.paused;
+      this.hint.open = false;
+      if (resume) await this.post('/api/resume');
+    },
+    canSaveHint() {
+      const h = this.hint;
+      return h.mode === 'all' ? !!h.text.trim() : !!(h.newTitle.trim() || h.topic || h.newTopic.trim());
     },
     async saveHint() {
       const h = this.hint;
       const r = await (await fetch('/api/hints', { method: 'POST', body: JSON.stringify({
-        sha: h.sha, text: h.text, topic: h.newTopic.trim() || h.topic, words: h.words }) })).json();
-      h.result = r.ok ? 'Сохранено.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '') : 'Не сохранилось: ' + r.error;
+        mode: h.mode, sha: h.sha, text: h.text, title: h.newTitle.trim(), topic: h.newTopic.trim() || h.topic, words: h.words }) })).json();
+      h.result = !r.ok ? 'Не сохранилось: ' + r.error
+        : h.mode === 'one' ? 'Исправлено.'
+        : 'Запомнено: будет учтено со следующего скриншота.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '');
       if (r.ok && this.folder.open) this.openFolder(this.folder.path);
     },
     async move(f, topic) {

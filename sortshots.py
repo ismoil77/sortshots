@@ -391,9 +391,13 @@ def final(r, topic_list):
         topic = CHECK
     elif max(x["confidence"] for x in (fast, strong) if x) < 0.7:
         topic = CHECK
-    if ov:
-        topic = ov
-    return dict(best, topic=topic)
+    if isinstance(ov, str):  # старый формат: только папка
+        ov = {"topic": ov}
+    ov = ov or {}
+    out = dict(best, topic=ov.get("topic") or topic)
+    if ov.get("title"):  # название, исправленное вручную
+        out["title"] = ov["title"]
+    return out
 
 
 def needs_strong(r, topic_list):
