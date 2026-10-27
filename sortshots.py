@@ -378,7 +378,7 @@ def word_rules():
     global _rules
     mtime = HINTS.stat().st_mtime if HINTS.exists() else 0
     if _rules[0] != mtime:
-        _rules = (mtime, [(p, h["topic"], h.get("text", "")) for h in load_json(HINTS, [])
+        _rules = (mtime, [(p, h["topic"], h.get("words", "")) for h in load_json(HINTS, [])
                           if h.get("topic") and (p := words_pattern(h.get("words", "")))])
     return _rules[1]
 
@@ -482,9 +482,9 @@ def final(r, topic_list):
     why = ""
     # Правило со словами: в названии или ключевых словах разбора есть слово из подсказки — сразу в её папку
     said = " ".join([best.get("title", "")] + best.get("keywords", []))
-    for pat, rule_topic, text in word_rules():
+    for pat, rule_topic, words in word_rules():
         if rule_topic in topic_list and pat.search(said):
-            topic, why = rule_topic, f"правило: {text or pat.pattern}"
+            topic, why = rule_topic, f"по словам: {words}"
             break
     # Почти тот же экран, что владелец уже разложил сам, — туда же, что бы ни сказала нейросеть
     same = [x for x in best.get("similar", []) if x["score"] >= SAME_SCREEN and x["kind"] == "shot"

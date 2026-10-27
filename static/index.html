@@ -67,12 +67,25 @@
   .card.moved { opacity: .45; }
   .zoom img { max-width: 94vw; max-height: 90vh; }
   textarea.topics { min-height: 340px; font-family: ui-monospace, monospace; font-size: .85rem; }
-  .crop { position: relative; display: inline-block; touch-action: none; user-select: none; cursor: crosshair; }
+  .crop { position: relative; display: inline-block; touch-action: none; user-select: none; cursor: crosshair; overflow: hidden; border-radius: 8px; }
   .crop img { display: block; max-width: 100%; max-height: 60vh; border-radius: 8px; pointer-events: none; }
   .crop .box { position: absolute; border: 2px solid var(--pico-primary); background: color-mix(in srgb, var(--pico-primary) 15%, transparent);
                box-shadow: 0 0 0 9999px rgba(0, 0, 0, .35); border-radius: 3px; }
-  .hint-grid { display: grid; grid-template-columns: minmax(160px, 260px) 1fr; gap: 1.2rem; align-items: start; }
-  @media (max-width: 640px) { .hint-grid { grid-template-columns: 1fr; } }
+  .hint-grid { display: grid; grid-template-columns: minmax(150px, 240px) 1fr; gap: 1.4rem; align-items: start; }
+  .crop:not(.on) { cursor: default; }
+  .hint-now { padding: .6rem .8rem; border-radius: 8px; background: var(--pico-card-sectioning-background-color); }
+  .step-h { margin: 1.1rem 0 .5rem; font-size: .95rem; }
+  .picks { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .pick { width: auto; margin: 0; padding: .3rem .7rem; font-size: .85rem; border-radius: 99px; line-height: 1.3;
+          background: transparent; color: var(--pico-contrast); border: 1px solid var(--pico-muted-border-color); --pico-color: var(--pico-contrast); }
+  .pick.cur { border-style: dashed; }
+  .pick.on { background: var(--pico-primary); border-color: var(--pico-primary); color: var(--pico-primary-inverse); }
+  .pick.add { color: var(--pico-primary); border-color: var(--pico-primary); }
+  .pick.word.on::before { content: "✓ "; }
+  .pick-input { width: 12rem !important; margin: 0 !important; padding: .3rem .7rem !important; font-size: .85rem !important; height: auto !important; border-radius: 99px !important; }
+  .result { margin: 1rem 0 0; padding: .6rem .8rem; border-radius: 8px; background: color-mix(in srgb, #16a34a 12%, transparent); }
+  details summary { font-size: .9rem; }
+  @media (max-width: 640px) { .hint-grid { grid-template-columns: 1fr; } .hint-grid .crop img { max-height: 32vh; } }
 </style>
 </head>
 <body>
@@ -271,64 +284,57 @@
   </dialog>
 
   <dialog :open="hint.open" @keydown.escape.window="hint.open && closeHint()">
-    <article style="width:min(980px,96vw)">
-      <header><strong>Исправить или научить</strong></header>
+    <article style="width:min(940px,96vw)">
+      <header><strong>Где должен лежать этот скриншот?</strong></header>
       <div class="hint-grid">
       <div>
-        <div class="crop" x-show="hint.mode !== 'one'" @pointerdown="cropStart($event)" @pointermove="cropMove($event)" @pointerup="cropEnd()" @pointercancel="cropEnd()">
+        <div class="crop" :class="hint.explain && 'on'" @pointerdown="hint.explain && cropStart($event)" @pointermove="cropMove($event)" @pointerup="cropEnd()" @pointercancel="cropEnd()">
           <img :src="hint.sha ? '/img/' + hint.sha + '?w=720' : ''" alt="" draggable="false">
           <div class="box" x-show="hint.box" :style="boxStyle()"></div>
         </div>
-        <img x-show="hint.mode === 'one'" :src="hint.sha ? '/img/' + hint.sha + '?w=720' : ''" alt="" style="max-width:100%;max-height:60vh;border-radius:8px">
-        <small class="muted" x-show="hint.mode !== 'one'" style="display:block;margin-top:.3rem"
-               x-text="hint.box ? 'Выделено. Обвести заново — просто веди мышкой ещё раз.' : 'Можно обвести мышкой часть картинки, на которую смотреть.'"></small>
+        <small class="muted" x-show="hint.explain" style="display:block;margin-top:.3rem"
+               x-text="hint.box ? 'Выделено. Обвести заново — веди мышкой ещё раз.' : 'Можно обвести мышкой, куда смотреть (необязательно).'"></small>
         <a href="#" x-show="hint.box" @click.prevent="hint.box = null" style="font-size:.85rem">убрать выделение</a>
       </div>
       <div>
-      <span class="muted" x-text="'Сейчас: ' + hint.title"></span>
-      <p x-show="hint.paused" style="margin:.4rem 0 0;font-size:.85rem">⏸ Разбор на паузе, пока ты пишешь. Продолжится, когда закроешь это окно.</p>
-      <fieldset style="margin-top:1rem">
-        <label><input type="radio" value="one" x-model="hint.mode"> Поправлю сам <small class="muted" style="display:block;margin:.15rem 0 .5rem 1.9rem">сам выберу папку и название этого скриншота</small></label>
-        <label><input type="radio" value="redo" x-model="hint.mode"> Неверно — переразбери этот <small class="muted" style="display:block;margin:.15rem 0 .5rem 1.9rem">напишу, что тут на самом деле, нейросеть разберёт его заново первым</small></label>
-        <label><input type="radio" value="all" x-model="hint.mode"> Запомнить для всех (обучение) <small class="muted" style="display:block;margin:.15rem 0 0 1.9rem">правило и выделенный кусок станут образцом для всех скриншотов</small></label>
-      </fieldset>
-      <template x-if="hint.mode === 'redo'">
-        <label>Что на скриншоте на самом деле
-          <textarea x-model="hint.text" rows="3" placeholder="Например: это не переписка, а карточка контакта Алишера с номером телефона."></textarea>
-        </label>
-      </template>
-      <label x-show="hint.mode !== 'redo'">Название файла
-        <input x-model="hint.newTitle" :placeholder="hint.title">
-      </label>
-      <div class="grid">
-        <label>Папка
-          <select x-model="hint.topic">
-            <option value="">— не менять —</option>
-            <template x-for="t in allTopics()"><option :value="t" x-text="t"></option></template>
-          </select>
-        </label>
-        <label>…или новая папка
-          <input x-model="hint.newTopic" placeholder="Например: Рецепты">
-        </label>
-      </div>
-      <template x-if="hint.mode === 'all'">
-        <div>
-          <label>Что запомнить
-            <textarea x-model="hint.text" rows="3" placeholder="Например: карточка контакта с номером — это не переписка, а контакт. Или: «Вахдат» пишется так, а не «Вахдад»."></textarea>
-          </label>
-          <label>Слова, по которым узнавать
-            <input x-model="hint.words" placeholder="через запятую: семечк, орех, подсолнечн">
-            <small class="muted">Если папка выбрана: скриншоты, в названии которых есть одно из слов, сразу лягут в неё, и уже разобранные тоже.
-              Часть слова ловит все формы: «семечк» — и «семечки», и «семечками». Без папки найденные просто разберутся заново.</small>
-          </label>
+        <div class="hint-now">
+          <b x-text="hint.title"></b>
+          <div class="muted" style="font-size:.85rem">сейчас в «<span x-text="hint.cur"></span>»<span x-show="hint.why" x-text="' · ' + hint.why"></span></div>
+          <a href="#" style="font-size:.85rem" x-show="!hint.rename" @click.prevent="hint.rename = true">переименовать</a>
+          <input x-show="hint.rename" x-model="hint.newTitle" :placeholder="hint.title" style="margin:.4rem 0 0">
         </div>
-      </template>
-      <p x-show="hint.result" x-text="hint.result"></p>
+        <p x-show="hint.paused" class="muted" style="margin:.5rem 0 0;font-size:.85rem">⏸ Разбор ждёт, пока открыто это окно.</p>
+
+        <h6 class="step-h">1. Нажми нужную папку</h6>
+        <div class="picks">
+          <template x-for="t in pickTopics()">
+            <button type="button" class="pick" :class="{ on: hint.topic === t, cur: hint.cur === t }" @click="hint.topic = hint.topic === t ? '' : t; hint.newTopic = ''" x-text="t + (hint.cur === t ? ' · сейчас' : '')"></button>
+          </template>
+          <button type="button" class="pick add" x-show="!hint.adding" @click="hint.adding = true; hint.topic = ''">+ новая папка</button>
+        </div>
+        <input x-show="hint.adding" x-model="hint.newTopic" @input="hint.topic = ''" placeholder="Название новой папки, например: Товары" style="margin-top:.5rem">
+
+        <h6 class="step-h">2. Чтобы похожие легли туда же — нажми слова, по которым их узнать <span class="muted">(необязательно)</span></h6>
+        <div class="picks">
+          <template x-for="w in hint.suggest">
+            <button type="button" class="pick word" :class="hint.picked.includes(w) && 'on'" @click="toggleWord(w)" x-text="w"></button>
+          </template>
+          <input class="pick-input" x-model="hint.own" @keydown.enter.prevent="addWord()" placeholder="своё слово + Enter">
+        </div>
+        <small class="muted" x-show="hint.picked.length" style="display:block;margin-top:.3rem"
+               x-text="'Все скриншоты, где в названии есть «' + hint.picked.join('», «') + '», лягут в «' + target() + '» — и уже разобранные тоже.'"></small>
+
+        <details :open="hint.explain" @toggle="hint.explain = $event.target.open" style="margin-top:1rem">
+          <summary>Нейросеть не поняла, что на картинке? Объясни — разберёт заново</summary>
+          <textarea x-model="hint.text" rows="3" placeholder="Например: это не мем, а фото нашего товара — пакет семечек на продажу."></textarea>
+        </details>
+
+        <p x-show="hint.result" class="result" x-text="hint.result"></p>
       </div>
       </div>
       <footer>
         <button class="secondary" @click="closeHint()" x-text="hint.result ? 'Закрыть' : 'Отмена'"></button>
-        <button @click="saveHint()" :disabled="!!hint.result || !canSaveHint()">Сохранить</button>
+        <button @click="saveHint()" x-show="!hint.result" :disabled="!canSaveHint()" x-text="saveLabel()"></button>
       </footer>
     </article>
   </dialog>
@@ -435,11 +441,40 @@ function app() {
       this.folder.items = await (await fetch('/api/folder?path=' + encodeURIComponent(path))).json();
     },
     async openHint(f) {
-      // разбор ждёт, пока пишется подсказка: иначе следующие скриншоты уйдут без неё
+      // разбор ждёт, пока открыто окно: иначе следующие скриншоты уйдут без подсказки
       const pause = this.s.running && !this.s.paused;
-      this.hint = { open: true, sha: f.sha, title: f.title, newTitle: '', mode: 'redo', text: '', topic: '', newTopic: '',
-                    words: '', result: '', paused: pause, box: null, drag: null };
+      this.hint = { open: true, sha: f.sha, title: f.title, cur: f.topic || '', why: '', suggest: [], picked: [], own: '',
+                    newTitle: '', rename: false, topic: '', newTopic: '', adding: false, text: '', explain: false,
+                    result: '', paused: pause, box: null, drag: null };
       if (pause) await this.post('/api/pause');
+      const info = await (await fetch('/api/shot?sha=' + f.sha)).json();
+      if (info.sha === this.hint.sha) Object.assign(this.hint, { title: info.title, cur: info.topic, why: info.why, suggest: info.words });
+    },
+    toggleWord(w) {
+      const p = this.hint.picked;
+      this.hint.picked = p.includes(w) ? p.filter(x => x !== w) : [...p, w];
+    },
+    addWord() {
+      const w = this.hint.own.trim().toLowerCase();
+      if (w && !this.hint.suggest.includes(w)) this.hint.suggest.push(w);
+      if (w && !this.hint.picked.includes(w)) this.hint.picked.push(w);
+      this.hint.own = '';
+    },
+    pickTopics() {  // частые папки первыми, «Проверить» в конце
+      const n = Object.fromEntries(this.s.tree);
+      return [...this.s.topics].sort((a, b) => (n[b] || 0) - (n[a] || 0)).concat('Проверить');
+    },
+    target() { return this.hint.newTopic.trim() || this.hint.topic || this.hint.cur; },
+    hintMode() {
+      const h = this.hint;
+      if (h.explain && h.text.trim()) return 'redo';
+      return h.picked.length ? 'all' : 'one';
+    },
+    saveLabel() {
+      const m = this.hintMode(), t = this.target();
+      if (m === 'redo') return 'Разобрать заново';
+      if (m === 'all') return 'Сохранить и запомнить';
+      return t && t !== this.hint.cur ? 'Переложить в «' + t + '»' : 'Сохранить';
     },
     // выделение части картинки: координаты в долях от 0 до 1, чтобы не зависеть от размера превью
     cropPoint(e) {
@@ -480,23 +515,23 @@ function app() {
       if (resume) await this.post('/api/resume');
     },
     canSaveHint() {
-      const h = this.hint;
-      if (h.mode === 'all') return !!(h.text.trim() || h.box);
-      if (h.mode === 'redo') return !!(h.text.trim() || h.topic || h.newTopic.trim());
-      return !!(h.newTitle.trim() || h.topic || h.newTopic.trim());
+      const h = this.hint, m = this.hintMode(), t = this.target();
+      if (m === 'redo') return true;
+      if (m === 'all') return !!t && t !== 'Проверить';
+      return !!(h.newTitle.trim() || (t && t !== h.cur));
     },
     async saveHint() {
-      const h = this.hint;
+      const h = this.hint, mode = this.hintMode(), t = this.target();
+      const topic = mode === 'all' || t !== h.cur ? t : '';
       const r = await (await fetch('/api/hints', { method: 'POST', body: JSON.stringify({
-        mode: h.mode, sha: h.sha, text: h.text, title: h.mode === 'redo' ? '' : h.newTitle.trim(),
-        topic: h.newTopic.trim() || h.topic, words: h.words, box: h.mode === 'one' ? null : h.box }) })).json();
+        mode, sha: h.sha, text: mode === 'redo' ? h.text : '', title: mode === 'redo' ? '' : h.newTitle.trim(),
+        topic, words: h.picked.join(', '), box: mode === 'redo' ? h.box : null }) })).json();
       h.result = !r.ok ? 'Не сохранилось: ' + r.error
-        : h.mode === 'one' ? 'Исправлено.' + (r.queued ? ' Таких же экранов среди разобранных: ' + r.queued + ', они разберутся заново с этим примером.' : '')
-        : h.mode === 'redo' ? (r.running ? 'Принято: этот скриншот разберётся следующим.'
-                                         : 'Принято: разберётся первым, когда нажмёшь «Продолжить разбор».')
-                              + (r.queued > 1 ? ' Следом за ним — ещё ' + (r.queued - 1) + ' таких же экранов.' : '')
-        : 'Запомнено: будет учтено со следующего скриншота.' + (r.queued ? ' Похожих в очереди на перепроверку: ' + r.queued + '.' : '')
-          + (r.moved ? ' По словам подходят уже разобранные: ' + r.moved + ', они в этой папке.' : '');
+        : mode === 'redo' ? (r.running ? '✓ Разберётся заново следующим.' : '✓ Разберётся заново первым, когда нажмёшь «Продолжить разбор».')
+                            + (r.queued > 1 ? ' Таких же экранов следом: ' + (r.queued - 1) + '.' : '')
+        : mode === 'all' ? '✓ Запомнено. Сейчас в «' + t + '» по этим словам: ' + (r.moved || 0) + '. Новые скриншоты тоже лягут туда.'
+        : '✓ Переложено' + (topic ? ' в «' + topic + '»' : '') + '.'
+          + (r.queued ? ' Таких же экранов среди разобранных: ' + r.queued + ' — разберутся заново по этому примеру.' : '');
       if (r.ok && this.folder.open) this.openFolder(this.folder.path);
     },
     async move(f, topic) {

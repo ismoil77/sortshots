@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Приложение для разбора скриншотов: живой прогресс, папки, проверка. http://127.0.0.1:8765"""
-import json, mimetypes, shutil, socket, subprocess, sys, threading, time, traceback, urllib.request
+import json, re, mimetypes, shutil, socket, subprocess, sys, threading, time, traceback, urllib.request
 from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
@@ -400,7 +400,8 @@ class Worker:
         if mode == "one":
             return {"ok": True, "queued": queued}
         hid = int(time.time() * 1000)
-        hint = {"id": hid, "text": text.strip(), "topic": topic or "", "words": words.strip(),
+        text = text.strip() or (f"Скриншоты со словами: {words.strip()}" if words.strip() else "")
+        hint = {"id": hid, "text": text, "topic": topic or "", "words": words.strip(),
                 "sha": sha or "", "created": time.strftime("%Y-%m-%d %H:%M")}
         if box and sha in self.by:
             hint["crop"] = S.save_crop(self.by[sha], box, f"hint_{hid}")
@@ -408,7 +409,7 @@ class Worker:
         pat = S.words_pattern(words)
         if pat and topic:  # правило со словами и папкой работает без нейросети: разложить заново, и всё
             with self.lock:
-                moved = sum(1 for r in self.res.values() if r.get("fast") and S.final(r, S.topics())["why"].startswith("правило"))
+                moved = sum(1 for r in self.res.values() if r.get("fast") and S.final(r, S.topics())["topic"] == topic)
             self.place(force=True)
             return {"ok": True, "queued": queued, "moved": moved}
         if pat:
@@ -472,6 +473,15 @@ class Worker:
                             "entities": f.get("entities", []), "why": f.get("why", "")})
         return sorted(out, key=lambda x: x["file"])
 
+    def shot(self, sha):
+        """Для окна «Подсказать»: где лежит, почему, и слова, по которым узнавать похожие."""
+        r = self.res.get(sha)
+        f = S.final(r, S.topics()) if r else None
+        if not f:
+            return None
+        return {"sha": sha, "title": f["title"], "topic": f["topic"], "why": f.get("why", ""),
+                "words": suggest_words([f["title"], f.get("app", "")] + f.get("keywords", []))}
+
     def set_topic(self, sha, topic=None, title=None):
         """Ручное исправление одного скриншота: папка и/или название."""
         ov = S.load_json(S.OVERRIDES, {})
@@ -487,6 +497,25 @@ class Worker:
 
 
 W = None
+
+STOP = set("""это как для или при под над без что где все его она они оно так уже был была были есть нет
+экран скриншот фото изображение картинка текст страница приложение телефон кнопка кнопки окно сообщение
+сообщения номер номера список меню новый новая новое""".split())
+ENDINGS = re.compile(r"(ами|ями|ого|его|ему|ому|ыми|ими|ах|ях|ов|ев|ей|ой|ий|ый|ая|яя|ое|ее|ые|ие|ую|юю|ом|ем|ам|ям|а|я|о|е|и|ы|у|ю|ь|й)$")
+
+
+def suggest_words(texts, n=10):
+    """Слова-кандидаты для правила: из названия и ключевых слов, без окончаний («семечки» → «семечк»),
+    чтобы одно слово ловило все формы."""
+    out = []
+    for w in re.findall(r"[\w-]+", " ".join(texts).lower()):
+        if len(w) < 4 or w.isdigit() or w in STOP:
+            continue
+        stem = ENDINGS.sub("", w) if re.search("[а-яё]", w) else w
+        stem = stem if len(stem) >= 4 else w
+        if stem not in out:
+            out.append(stem)
+    return out[:n]
 
 
 def thumb(sha, width):
@@ -535,6 +564,8 @@ class H(BaseHTTPRequestHandler):
             if f.parent != S.EXAMPLES.resolve() or not f.exists():
                 return self.send_error(404)
             return self.send(f.read_bytes(), "image/jpeg")
+        if u.path == "/api/shot":
+            return self.send(W.shot(q.get("sha", "")) or {})
         if u.path == "/api/folder":
             return self.send(W.folder(q.get("path", "")))
         if u.path == "/api/events":
@@ -570,7 +601,7 @@ class H(BaseHTTPRequestHandler):
             if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)
                     and box[2] > 0.01 and box[3] > 0.01):
                 box = None  # случайный клик вместо выделения
-            if mode == "all" and not ((body.get("text") or "").strip() or box):
+            if mode == "all" and not ((body.get("text") or "").strip() or box or (body.get("words") or "").strip()):
                 return self.send({"ok": False, "error": "напиши, что запомнить"}, code=400)
             if mode == "redo" and not ((body.get("text") or "").strip() or body.get("topic")):
                 return self.send({"ok": False, "error": "напиши, что на скриншоте на самом деле"}, code=400)
