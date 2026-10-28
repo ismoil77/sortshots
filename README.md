@@ -6,11 +6,22 @@
 
 ## Установка на Windows
 
-1. Скачай `Sortshots-Setup-*.exe` со страницы Releases и запусти. Права администратора не нужны.
+1. Скачай `Sortshots-Setup-*.exe` со страницы [Releases](https://github.com/ismoil77/sortshots/releases/latest) и запусти. Права администратора не нужны.
 2. При первом запуске нажми «Установить Ollama», потом «Скачать» у быстрой модели (≈ 3,3 ГБ).
 3. «Выбрать папку» → укажи папку со скриншотами. Или подключи телефон кабелем с включённой «Отладкой по USB» и нажми «С телефона по USB».
 
 Результат: `Изображения\Скриншоты\<Тема>\`. Оригиналы не меняются.
+
+## Установка на Linux
+
+```bash
+git clone https://github.com/ismoil77/sortshots.git ~/sortshots
+~/sortshots/packaging/install_linux.sh
+```
+
+Скрипт ставит окружение Python, команду `sortshots-app` и ярлык «Разбор скриншотов» в меню. Нужны Python 3.10+ и [Ollama](https://ollama.com/download/linux). Обновить: `git pull` и запустить скрипт ещё раз. Убрать: `install_linux.sh --remove` (скриншоты не трогает).
+
+Результат: `~/Pictures/Скриншоты/<Тема>/`.
 
 Лучше всего работает с видеокартой NVIDIA (от 6 ГБ). Без неё тоже работает, но заметно медленнее.
 
@@ -29,4 +40,4 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python sortshots.py --help     # то же из командной строки
 ```
 
-Установщик для Windows собирает GitHub Actions (`.github/workflows/windows.yml`): тег `v1.0.0` → релиз с `Sortshots-Setup-1.0.0.exe`. Рецепт: `packaging/sortshots.spec` (PyInstaller) и `packaging/installer.iss` (Inno Setup).
+GitHub Actions (`.github/workflows/build.yml`) на каждый push проверяет установку на Linux и собирает установщик для Windows (самопроверка `.exe` и тихая установка). Тег `v1.0.0` → релиз с `Sortshots-Setup-1.0.0.exe`. Без GitHub установщик собирается на Linux через Wine: `packaging/build_wine.sh 1.0.0`. Рецепт: `packaging/sortshots.spec` (PyInstaller) и `packaging/installer.iss` (Inno Setup).

@@ -1,15 +1,50 @@
-name: Windows installer
+name: Build
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Model for similar screenshots (cached)
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/Sortshots/models
+          key: siglip2-base-patch16-224-vision
+
+      - name: Install like a user (venv, launcher, menu entry, self-test)
+        run: packaging/install_linux.sh
+
+      - name: Self-test with the similar-screenshots model
+        run: |
+          .venv/bin/python -c "import similar; similar.fetch()"
+          .venv/bin/python desktop.py --selftest
+
+      - name: Remove
+        run: |
+          packaging/install_linux.sh --remove
+          test ! -e ~/.local/bin/sortshots-app
+
+  windows:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -41,7 +76,7 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.1.0' }
+          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0' }
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
           & $iscc "/DAppVersion=$v" packaging\installer.iss
@@ -56,7 +91,10 @@ jobs:
           if ($p.ExitCode -ne 0) { exit 1 }
           $exe = "$env:LOCALAPPDATA\Programs\Sortshots\Sortshots.exe"
           $t = Start-Process $exe -ArgumentList '--selftest' -Wait -PassThru
-          if ($t.ExitCode -ne 0) { exit 1 }
+          if ($t.ExitCode -ne 0) {
+            Get-Content "$env:LOCALAPPDATA\Sortshots\selftest.log" -ErrorAction SilentlyContinue
+            exit 1
+          }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -68,3 +106,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/Sortshots-Setup-*.exe
+          generate_release_notes: true
