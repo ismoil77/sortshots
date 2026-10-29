@@ -117,18 +117,18 @@ class Placement(unittest.TestCase):
     def test_paths_are_relative(self):
         placed = S.load_placed()
         self.assertEqual(len(placed), len(SHOTS))
-        for rel in json.loads(S.PLACED.read_text()).values():
+        for rel in json.loads(S.PLACED.read_text(encoding="utf-8")).values():
             self.assertFalse(Path(rel).is_absolute(), rel)
             self.assertTrue((S.ROOT / rel).exists(), rel)
 
     def test_old_absolute_paths_still_read(self):
         old = {"x": str(S.ROOT / "Разное" / "a.jpg"), "y": "/somewhere/else/b.jpg"}
-        saved = S.PLACED.read_text()
+        saved = S.PLACED.read_text(encoding="utf-8")
         try:
             S.save_json(S.PLACED, old)
             self.assertEqual(S.load_placed(), {"x": "Разное/a.jpg"})
         finally:
-            S.PLACED.write_text(saved)
+            S.PLACED.write_text(saved, encoding="utf-8")
 
 
 class Secret(unittest.TestCase):
