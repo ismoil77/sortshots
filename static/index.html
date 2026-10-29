@@ -85,16 +85,30 @@
   .pick-input { width: 12rem !important; margin: 0 !important; padding: .3rem .7rem !important; font-size: .85rem !important; height: auto !important; border-radius: 99px !important; }
   .result { margin: 1rem 0 0; padding: .6rem .8rem; border-radius: 8px; background: color-mix(in srgb, #16a34a 12%, transparent); }
   details summary { font-size: .9rem; }
+  .toast { position: fixed; left: 50%; bottom: 1.5rem; transform: translateX(-50%); z-index: 1000; padding: .6rem 1.1rem;
+           border-radius: 8px; background: var(--pico-contrast); color: var(--pico-contrast-inverse); font-size: .9rem; }
+  .sugg { border: 1px solid var(--pico-primary); }
+  .sugg-row { display: flex; gap: .4rem; overflow-x: auto; }
+  .sugg-row img { height: 110px; border-radius: 6px; cursor: zoom-in; flex: none; }
+  .search { flex: 1 1 260px; margin: 0; max-width: 460px; }
+  .search input { margin: 0; }
+  .tag-match { padding: .05rem .45rem; border-radius: 99px; background: var(--pico-primary); color: var(--pico-primary-inverse); }
+  .tag-match.soft { background: transparent; color: var(--pico-primary); border: 1px solid var(--pico-primary); }
   @media (max-width: 640px) { .hint-grid { grid-template-columns: 1fr; } .hint-grid .crop img { max-height: 32vh; } }
 </style>
 </head>
 <body>
-<main class="container-fluid" x-data="app()" x-init="init()">
+<main class="container-fluid" x-data="app()" x-init="init()"
+      @keydown.ctrl.z.window="if (!$event.target.closest('input, textarea')) { $event.preventDefault(); undo(); }">
 
   <header class="top">
     <h1>Разбор скриншотов</h1>
     <span class="pill" :class="s.running && !s.paused && 'live'" x-text="phaseLabel()"></span>
+    <form class="search" role="search" @submit.prevent="doSearch()">
+      <input type="search" x-model="q" placeholder="Поиск: «пакет семечек», «10 000 TJS», «экран звонка»" aria-label="Поиск по скриншотам">
+    </form>
     <div class="btns">
+      <button class="secondary outline" x-show="s.undo" @click="undo()" :title="'Отменить: ' + s.undo + ' (Ctrl+Z)'" x-text="'↶ Отменить ' + s.undo"></button>
       <button class="secondary" @click="post('/api/import')" :disabled="s.running">Выбрать папку</button>
       <button class="secondary" @click="post('/api/start', {phone: true})" :disabled="s.running"
               title="Нужен кабель и включённая «Отладка по USB» на телефоне">С телефона по USB</button>
@@ -116,6 +130,20 @@
 
   <div class="layout">
     <section>
+      <template x-for="g in sugg" :key="g.key">
+        <article class="sugg">
+          <strong>💡 Похоже, ты учишь меня</strong>
+          <p style="margin:.4rem 0 .6rem">Ты переложил <b x-text="g.moved"></b> скриншота со словом «<b x-text="g.word"></b>» в «<b x-text="g.topic"></b>».
+            Ещё <b x-text="g.count"></b> таких лежат в других папках, больше всего в «<span x-text="g.from"></span>». Переложить их и запомнить правило?</p>
+          <div class="sugg-row">
+            <template x-for="sha in g.examples"><img :src="'/img/' + sha + '?w=160'" alt="" @click="zoom = sha"></template>
+          </div>
+          <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.6rem">
+            <button style="width:auto;margin:0" @click="acceptSugg(g)" x-text="'Да, все со словом «' + g.word + '» — в «' + g.topic + '»'"></button>
+            <button class="secondary outline" style="width:auto;margin:0" @click="dismissSugg(g)">Нет, не надо</button>
+          </div>
+        </article>
+      </template>
       <article x-show="!s.total && !s.running">
         <h3>С чего начать</h3>
         <ol>
@@ -255,15 +283,22 @@
     <article>
       <header style="display:flex;align-items:center;gap:1rem">
         <strong x-text="folder.path + ' · ' + folder.items.length"></strong>
-        <button class="secondary outline" style="margin:0 0 0 auto;width:auto;padding:.3rem .8rem" @click="post('/api/open', {path: folder.path})">Открыть в файлах</button>
+        <button class="secondary outline" x-show="!folder.search" style="margin:0 0 0 auto;width:auto;padding:.3rem .8rem" @click="post('/api/open', {path: folder.path})">Открыть в файлах</button>
+        <span x-show="folder.search" style="margin-left:auto"></span>
+        <button class="secondary outline" x-show="folder.path === 'Контакты и звонки'" style="margin:0;width:auto;padding:.3rem .8rem"
+                @click="saveContacts()" title="Все номера со скриншотов — в файл, который открывается на телефоне и добавляет контакты">Номера в телефонную книгу (.vcf)</button>
         <button class="secondary" style="margin:0;width:auto;padding:.3rem .8rem" @click="folder.open = false">Закрыть</button>
       </header>
-      <p class="muted">Если скриншот лежит не там, выбери правильную папку в списке под ним: файл переедет сразу.</p>
+      <p class="muted" x-show="!folder.search">Если скриншот лежит не там, выбери правильную папку в списке под ним: файл переедет сразу.</p>
+      <p class="muted" x-show="folder.search && folder.loading">Ищу…</p>
+      <p class="muted" x-show="folder.search && !folder.loading && !folder.items.length">Ничего не нашлось. Попробуй другое слово или часть слова.</p>
+      <p class="muted" x-show="folder.search && !folder.loading && folder.items.length && !folder.meaning">Поиск по смыслу заработает, когда скачается модель поиска похожих (при следующем разборе).</p>
       <div class="grid-files">
         <template x-for="f in folder.items" :key="f.sha">
           <div class="card" :class="f.moved && 'moved'">
             <img :src="'/img/' + f.sha + '?w=400'" alt="" loading="lazy" @click="zoom = f.sha">
             <strong x-text="f.title"></strong>
+            <span x-show="folder.search" style="font-size:.8rem"><span class="tag-match" :class="f.match === 'по смыслу' && 'soft'" x-text="f.match"></span> в «<span x-text="f.topic"></span>»</span>
             <span class="muted" x-text="f.description"></span>
             <div>
               <template x-for="e in f.entities"><span class="chip" x-text="e.name" style="margin:0 .25rem .25rem 0"></span></template>
@@ -369,6 +404,7 @@
       </footer>
     </article>
   </dialog>
+  <div class="toast" x-show="toast" x-text="toast" x-transition.opacity role="status"></div>
 </main>
 
 <script>
@@ -376,14 +412,32 @@ function app() {
   return {
     s: { settings: { strong: true }, total: 0, fast_done: 0, strong_done: 0, strong_need: 0, current: [], recent: [], tree: [], models: {},
          errors: [], phone: {}, setup: {}, windows: false, hints: [], queue: 0, speed: {}, topics: [], phase: 'idle', msg: '' },
-    folder: { open: false, path: '', items: [] },
+    folder: { open: false, path: '', items: [], search: false },
+    q: '',
+    toast: '',
+    sugg: [],
     topics: { open: false, text: '' },
     zoom: null,
-    hint: { open: false, sha: '', title: '', newTitle: '', mode: 'one', text: '', topic: '', newTopic: '', words: '', result: '', paused: false },
+    hint: { open: false, sha: '', title: '', cur: '', why: '', suggest: [], picked: [], own: '', newTitle: '', rename: false,
+            topic: '', newTopic: '', adding: false, text: '', explain: false, result: '', paused: false, box: null, drag: null },
     hintsOpen: false,
     counts: {}, bumps: {},
     bumped(path) { return Date.now() - (this.bumps[path] || 0) < 1200; },
+    async loadSugg() {
+      try { this.sugg = await (await fetch('/api/suggestions')).json(); } catch (e) {}
+    },
+    async acceptSugg(g) {
+      const r = await (await fetch('/api/suggestions/accept', { method: 'POST', body: JSON.stringify(g) })).json();
+      this.toast = 'Готово: в «' + g.topic + '» теперь ' + (r.moved || 0) + ' скриншотов со словом «' + g.word + '». Отменить — Ctrl+Z';
+      setTimeout(() => this.toast = '', 4000);
+      this.loadSugg(); this.refreshFolder();
+    },
+    async dismissSugg(g) {
+      await this.post('/api/suggestions/dismiss', { key: g.key });
+      this.loadSugg();
+    },
     init() {
+      this.loadSugg();
       const es = new EventSource('/api/events');
       es.onmessage = e => {
         const next = JSON.parse(e.data), now = Date.now();
@@ -437,8 +491,33 @@ function app() {
     bar(c) { const max = Math.max(1, ...this.s.tree.map(([, n]) => n)); return c ? Math.max(3, c * 100 / max) : 0; },
     allTopics() { return [...this.s.topics, 'Проверить']; },
     async openFolder(path) {
-      this.folder = { open: true, path, items: [] };
+      this.folder = { open: true, path, items: [], search: false };
       this.folder.items = await (await fetch('/api/folder?path=' + encodeURIComponent(path))).json();
+    },
+    async doSearch() {
+      const q = this.q.trim();
+      if (!q) return;
+      this.folder = { open: true, path: 'Поиск «' + q + '»', items: [], search: q, loading: true, meaning: true };
+      const r = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json();
+      if (this.folder.search === q) Object.assign(this.folder, { items: r.items, meaning: r.meaning, loading: false });
+    },
+    async saveContacts() {
+      const r = await (await fetch('/api/contacts', { method: 'POST' })).json();
+      this.toast = 'Сохранено ' + r.count + ' номеров (с именем ' + r.named + ') в «' + r.file + '» — в папке со скриншотами. Перешли файл на телефон и открой.';
+      setTimeout(() => this.toast = '', 7000);
+      this.post('/api/open', { path: '' });
+    },
+    async undo() {
+      if (!this.s.undo) return;
+      const r = await (await fetch('/api/undo', { method: 'POST' })).json();
+      this.loadSugg();
+      if (r.undone) this.toast = 'Отменено: ' + r.undone;
+      setTimeout(() => this.toast = '', 3000);
+      this.refreshFolder();
+    },
+    refreshFolder() {
+      if (!this.folder.open) return;
+      if (this.folder.search) { this.q = this.folder.search; this.doSearch(); } else this.openFolder(this.folder.path);
     },
     async openHint(f) {
       // разбор ждёт, пока открыто окно: иначе следующие скриншоты уйдут без подсказки
@@ -532,11 +611,12 @@ function app() {
         : mode === 'all' ? '✓ Запомнено. Сейчас в «' + t + '» по этим словам: ' + (r.moved || 0) + '. Новые скриншоты тоже лягут туда.'
         : '✓ Переложено' + (topic ? ' в «' + topic + '»' : '') + '.'
           + (r.queued ? ' Таких же экранов среди разобранных: ' + r.queued + ' — разберутся заново по этому примеру.' : '');
-      if (r.ok && this.folder.open) this.openFolder(this.folder.path);
+      if (r.ok) { this.refreshFolder(); this.loadSugg(); }
     },
     async move(f, topic) {
       await this.post('/api/set', { sha: f.sha, topic });
       f.moved = true;
+      this.loadSugg();
     },
     openTopics() { this.topics = { open: true, text: this.s.topics.join('\n') }; },
     async saveTopics() {

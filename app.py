@@ -38,9 +38,11 @@ class Worker:
         self.res = S.load_results()
         self.by = dict(S.index_sources()) if S.SRC.exists() else {}
         self.last_place = 0
+        self.last_groups = 0
         self.skip = set()  # не разобрались из-за ошибки в этом запуске
         self.done_since_save = 0
         self.sim_status = "готова" if SIM.ready() else "скачается при запуске"
+        self.add_new_topics()
         threading.Thread(target=self.check_models, daemon=True).start()
 
     # ---- состояние для страницы ----
@@ -72,6 +74,7 @@ class Worker:
                 "root": str(S.ROOT), "topics": topics,
                 "settings": S.load_json(SETTINGS, {"strong": True}),
                 "queue": len(S.load_json(S.QUEUE, [])), "hints": S.load_json(S.HINTS, []),
+                "undo": (S.load_json(UNDO, []) or [{}])[-1].get("label"),
             }
 
     def speed(self, stage):
@@ -210,6 +213,8 @@ class Worker:
         if not force and time.time() - self.last_place < 3:
             return
         with self.place_lock:
+            if force or time.time() - self.last_groups > 60:
+                self.update_groups()
             S.place(verbose=False)
             self.last_place = time.time()
             placed = S.load_placed()
@@ -235,6 +240,18 @@ class Worker:
         self.skip.add(sha)
         with S._lock:
             S.save_json(S.QUEUE, [x for x in S.load_json(S.QUEUE, []) if x != sha])
+
+    def update_groups(self):
+        """Почти одинаковые экраны — в одну папку (по большинству). Пересчёт ~0.2 с на 1300 скриншотов."""
+        self.last_groups = time.time()
+        try:
+            with self.lock:
+                topic_of = {sha: (r.get("strong") or r["fast"])["topic"] for sha, r in self.res.items() if r.get("fast")}
+            stale = set(S.load_json(S.QUEUE, []))
+            groups = SIM.majority(topic_of, voters=[x for x in topic_of if x not in stale])
+            S.save_json(S.GROUPS, {k: list(v) for k, v in groups.items()})
+        except Exception as e:
+            self.errors.append(f"одинаковые экраны: {e}")
 
     def run_pass(self, todo, model, stage, topics, workers, label=None, after=None):
         self.phase = stage
@@ -347,6 +364,17 @@ class Worker:
                 self.phase, self.msg = "idle", "Остановлено. Продолжить можно в любой момент."
             self.current.clear()
 
+    def add_new_topics(self):
+        """Темы, которые появились в новой версии, добавить к своим один раз (если удалишь — не вернутся)."""
+        st = S.load_json(SETTINGS, {"strong": True})
+        added = st.get("topics_added", [])
+        for t in (S.SECRET,):
+            if t not in added:
+                S.add_topic(t)
+                added.append(t)
+        if added != st.get("topics_added"):
+            S.save_json(SETTINGS, dict(st, topics_added=added))
+
     def fetch_similar(self):
         """Модель поиска похожих (около 370 МБ, один раз). Не скачалась — разбор идёт без неё."""
         if SIM.ready():
@@ -440,6 +468,77 @@ class Worker:
         S.queue_add([sha] + same, front=True)
         return {"ok": True, "queued": 1 + len(same), "running": bool(self.thread and self.thread.is_alive())}
 
+    # ---- приложение само предлагает правило ----
+
+    def suggestions(self):
+        """Ты переложил вручную несколько похожих скриншотов в одну папку — найти слово, которое их объединяет,
+        и такие же скриншоты, которые ещё лежат не там. Вернёт до 3 предложений."""
+        topics, ov = S.topics(), S.load_json(S.OVERRIDES, {})
+        dismissed = set(S.load_json(SETTINGS, {}).get("dismissed", []))
+        rules = {(h.get("topic"), w.strip()) for h in S.load_json(S.HINTS, []) for w in h.get("words", "").split(",")}
+        with self.lock:
+            shots = {sha: S.final(r, topics) for sha, r in self.res.items() if r.get("fast")}
+        moved = {}
+        for sha, o in ov.items():
+            t = o if isinstance(o, str) else (o or {}).get("topic")
+            if t and t in topics and sha in shots:
+                moved.setdefault(t, []).append(sha)
+        out = []
+        for target, shas in moved.items():
+            if len(shas) < 2:
+                continue
+            best = []
+            counts = Counter(w for sha in shas for w in set(suggest_words(
+                [shots[sha]["title"]] + shots[sha].get("keywords", []), n=30)))
+            for word, n in counts.most_common():
+                if n < 2 or (target, word) in rules or f"{target}|{word}" in dismissed:
+                    continue
+                pat = re.compile(r"(?<![\w])" + re.escape(word))
+                said = lambda f: " ".join([f["title"]] + f.get("keywords", [])).lower()
+                hits = [sha for sha, f in shots.items() if pat.search(said(f))]
+                there = sum(1 for sha in hits if shots[sha]["topic"] == target)
+                rest = [sha for sha in hits if shots[sha]["topic"] != target]
+                # слово должно отличать эту папку: среди всех скриншотов с ним большая часть уже там или переложена тобой
+                if rest and there >= len(hits) * 0.3:
+                    best.append({"key": f"{target}|{word}", "word": word, "topic": target, "moved": n,
+                                 "count": len(rest), "from": Counter(shots[x]["topic"] for x in rest).most_common(1)[0][0],
+                                 "examples": rest[:6]})
+            if best:  # одно предложение на папку: слово, которое найдёт больше всего
+                out.append(max(best, key=lambda x: (x["moved"], x["count"], len(x["word"]))))
+        return sorted(out, key=lambda x: -x["count"])[:3]
+
+    def dismiss(self, key):
+        st = S.load_json(SETTINGS, {"strong": True})
+        S.save_json(SETTINGS, dict(st, dismissed=st.get("dismissed", []) + [key]))
+
+    # ---- отмена ----
+    # Перед каждым действием владельца запоминаем файлы, которые оно меняет; отмена кладёт их обратно
+    # и раскладывает заново. Выделенные куски (examples/) не трогаем: без подсказки они ни на что не влияют.
+
+    def remember(self, label):
+        snap = {"label": label, "time": time.strftime("%H:%M"),
+                "files": {f.name: (f.read_text(encoding="utf-8") if f.exists() else None) for f in undo_files()}}
+        with self.lock:
+            stack = S.load_json(UNDO, [])[-(UNDO_DEPTH - 1):] + [snap]
+            S.save_json(UNDO, stack)
+
+    def undo(self):
+        with self.lock:
+            stack = S.load_json(UNDO, [])
+            if not stack:
+                return None
+            snap = stack.pop()
+            S.save_json(UNDO, stack)
+            with S._lock:
+                for f in undo_files():
+                    text = snap["files"].get(f.name)
+                    if text is None:
+                        f.unlink(missing_ok=True)
+                    else:
+                        f.write_text(text, encoding="utf-8")
+        self.place(force=True)
+        return snap["label"]
+
     def redo_all(self):
         """После обучения: заново разобрать всё, что уже разобрано. Ручные исправления остаются."""
         with self.lock:
@@ -467,11 +566,50 @@ class Worker:
         out = []
         for sha, p in placed.items():
             if sha in self.res and str(PurePosixPath(p).parent) == rel:
-                f = S.final(self.res[sha], topics)
-                out.append({"sha": sha, "file": Path(p).name, "topic": f["topic"], "title": f["title"],
-                            "description": f["description"], "conf": round(f["confidence"], 2),
-                            "entities": f.get("entities", []), "why": f.get("why", "")})
+                out.append(card(sha, S.final(self.res[sha], topics), p))
         return sorted(out, key=lambda x: x["file"])
+
+    def search(self, q, limit=120):
+        """Поиск: сначала по словам в том, что написала нейросеть (название важнее описания),
+        потом по смыслу — запрос сравнивается с самими картинками."""
+        topics, placed = S.topics(), S.load_placed()
+        with self.lock:
+            shots = {sha: S.final(self.res[sha], topics) for sha in placed if sha in self.res and self.res[sha].get("fast")}
+        terms = search_terms(q)
+        # слово ищем с начала слова («кот» → «котом», но не «который» в середине), числа — где угодно
+        pats = [re.compile(re.escape(t) if t.isdigit() else r"(?<![\w])" + re.escape(t)) for t in terms]
+        scored = []
+        for sha, f in shots.items():
+            fields = ((3, f["title"]), (2, " ".join([f.get("app", ""), f["topic"]] + f.get("keywords", [])
+                                                    + [e.get("name", "") for e in f.get("entities", [])])),
+                      (1, f.get("description", "") + " " + f.get("seen", "")))
+            hay = [(w, squash(t.lower())) for w, t in fields]
+            hits = [max((w for w, t in hay if pat.search(t)), default=0) for pat in pats]
+            n = sum(1 for h in hits if h)
+            if n:
+                scored.append((n, sum(hits), sha))
+        try:
+            meaning = SIM.by_meaning(q, list(shots))
+        except Exception as e:
+            meaning = {}
+            self.errors.append(f"поиск по смыслу: {e}")
+        # сначала те, где нашлись все слова запроса; если таких мало — и без одного слова
+        best = max((n for n, _, _ in scored), default=0)
+        keep = [x for x in scored if x[0] == best]
+        if best < len(terms) and len(keep) < 10 and best > 1:  # не все слова нашлись — покажем и без одного
+            keep = [x for x in scored if x[0] >= best - 1]
+        keep.sort(key=lambda x: (-x[0], -x[1], -meaning.get(x[2], 0)))
+        out = [dict(card(sha, shots[sha], placed[sha]), match="по словам") for _, _, sha in keep[:limit]]
+        seen = {o["sha"] for o in out}
+        rest = sorted(((v, sha) for sha, v in meaning.items() if sha not in seen), reverse=True)
+        # По смыслу: сходство текста с картинкой у SigLIP маленькое по числу. На твоих скриншотах удачные
+        # запросы («калькулятор», «пакет семечек») дают 0.17–0.19, мимо («github» без таких скриншотов) — 0.12.
+        floor = MEANING_ALONE if not out else MEANING_EXTRA
+        if rest and rest[0][0] >= floor:
+            top = rest[0][0]
+            out += [dict(card(sha, shots[sha], placed[sha]), match="по смыслу")
+                    for v, sha in rest[:30] if v >= max(floor, top - 0.025)]
+        return {"items": out, "meaning": bool(meaning)}
 
     def shot(self, sha):
         """Для окна «Подсказать»: где лежит, почему, и слова, по которым узнавать похожие."""
@@ -497,11 +635,53 @@ class Worker:
 
 
 W = None
+UNDO = S.DATA / "undo.json"
+UNDO_DEPTH = 20
+
+
+def undo_files():
+    return [S.OVERRIDES, S.HINTS, S.NOTES, S.QUEUE, S.TOPICS]
 
 STOP = set("""это как для или при под над без что где все его она они оно так уже был была были есть нет
 экран скриншот фото изображение картинка текст страница приложение телефон кнопка кнопки окно сообщение
 сообщения номер номера список меню новый новая новое""".split())
 ENDINGS = re.compile(r"(ами|ями|ого|его|ему|ому|ыми|ими|ах|ях|ов|ев|ей|ой|ий|ый|ая|яя|ое|ее|ые|ие|ую|юю|ом|ем|ам|ям|а|я|о|е|и|ы|у|ю|ь|й)$")
+
+
+def card(sha, f, rel):
+    """Карточка скриншота для окна папки и поиска."""
+    return {"sha": sha, "file": Path(rel).name, "path": rel, "topic": f["topic"], "title": f["title"],
+            "description": f["description"], "conf": round(f["confidence"], 2),
+            "entities": f.get("entities", []), "why": f.get("why", "")}
+
+
+def squash(text):
+    """«10 000 TJS» и «10000» должны совпадать: убрать пробелы между цифрами."""
+    return re.sub(r"(?<=\d)[\s\u00a0](?=\d)", "", text)
+
+
+MEANING_ALONE, MEANING_EXTRA = 0.135, 0.15
+STOP_SEARCH = {"для", "как", "или", "что", "это", "где", "все", "при", "под", "над", "без", "про"}
+
+
+def search_terms(q):
+    """Слова запроса без окончаний; числа — как есть."""
+    out = []
+    for w in re.findall(r"[\w-]+", squash(q.lower())):
+        if w.isdigit():
+            term = w
+        elif len(w) < 3 or w in STOP_SEARCH:  # «с», «на», «для» совпадают со всем подряд
+            continue
+        elif re.search("[а-яё]", w):
+            term = ENDINGS.sub("", w)
+            term = term if len(term) >= 3 else w
+            if len(term) >= 6:  # «семечек» → «семеч», «звонок» → «звон»: ловит и «семечки», и «звонка»
+                term = term[:max(4, len(term) - 2)]
+        else:
+            term = w
+        if term and term not in out:
+            out.append(term)
+    return out
 
 
 def suggest_words(texts, n=10):
@@ -564,6 +744,10 @@ class H(BaseHTTPRequestHandler):
             if f.parent != S.EXAMPLES.resolve() or not f.exists():
                 return self.send_error(404)
             return self.send(f.read_bytes(), "image/jpeg")
+        if u.path == "/api/suggestions":
+            return self.send(W.suggestions())
+        if u.path == "/api/search":
+            return self.send(W.search(q.get("q", "")) if q.get("q", "").strip() else {"items": []})
         if u.path == "/api/shot":
             return self.send(W.shot(q.get("sha", "")) or {})
         if u.path == "/api/folder":
@@ -605,15 +789,32 @@ class H(BaseHTTPRequestHandler):
                 return self.send({"ok": False, "error": "напиши, что запомнить"}, code=400)
             if mode == "redo" and not ((body.get("text") or "").strip() or body.get("topic")):
                 return self.send({"ok": False, "error": "напиши, что на скриншоте на самом деле"}, code=400)
+            W.remember({"one": "исправление скриншота", "redo": "переразбор с объяснением"}.get(mode, "правило"))
             return self.send(W.add_hint(mode, body.get("text") or "", body.get("topic"), body.get("words") or "",
                                         body.get("sha"), body.get("title"), box))
+        if p == "/api/suggestions/accept":
+            W.remember("правило «" + body["word"] + "»")
+            return self.send(W.add_hint("all", "", body["topic"], body["word"], "", None, None))
+        if p == "/api/suggestions/dismiss":
+            W.dismiss(body["key"])
+            return self.send({"ok": True})
+        if p == "/api/contacts":
+            book = S.contacts()
+            path = S.write_vcf(book)
+            return self.send({"ok": True, "count": len(book), "named": sum(1 for v in book.values() if v),
+                              "file": path.name})
+        if p == "/api/undo":
+            return self.send({"ok": True, "undone": W.undo()})
         if p == "/api/redo-all":
+            W.remember("переразбор всего")
             return self.send({"ok": True, "queued": W.redo_all()})
         if p == "/api/queue/clear":
+            W.remember("очистка очереди")
             with S._lock:
                 S.save_json(S.QUEUE, [])
             return self.send({"ok": True})
         if p == "/api/hints/delete":
+            W.remember("удаление подсказки")
             W.delete_hint(body.get("id"))
             return self.send({"ok": True})
         if p == "/api/pull":
@@ -627,13 +828,15 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/stop":
             W.stop.set()
         elif p == "/api/set":
+            W.remember("перенос в «" + body["topic"] + "»")
             W.set_topic(body["sha"], body["topic"])
             return self.send({"ok": True, "queued": W.queue_similar(body["sha"])})
         elif p == "/api/topics":
+            W.remember("изменение тем")
             t = [x.strip() for x in body["topics"] if x.strip()]
             S.save_json(S.TOPICS, t)
         elif p == "/api/settings":
-            S.save_json(SETTINGS, {"strong": bool(body.get("strong"))})
+            S.save_json(SETTINGS, dict(S.load_json(SETTINGS, {}), strong=bool(body.get("strong"))))
         elif p == "/api/open":
             f = (S.ROOT / body.get("path", "")).resolve()
             root = S.ROOT.resolve()

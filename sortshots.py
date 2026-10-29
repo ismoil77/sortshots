@@ -26,6 +26,7 @@ OVERRIDES = DATA / "overrides.json"
 PLACED = DATA / "placed.json"
 HINTS = DATA / "hints.json"            # подсказки владельца: попадают в инструкцию модели
 QUEUE = DATA / "recheck_queue.json"    # уже разобранные скриншоты, которые надо разобрать заново
+GROUPS = DATA / "same_screens.json"  # почти одинаковые экраны, которые нейросеть разложила по-разному
 NOTES = DATA / "notes.json"            # комментарии владельца к отдельным скриншотам: «это не то, а вот что»
 EXAMPLES = DATA / "examples"           # вырезанные куски скриншотов — образцы для обучения
 # Сходство «тот же экран» (similar.py). На настоящих скриншотах при 0.97 и выше разные темы у пары почти всегда
@@ -45,6 +46,14 @@ PHONE_DIRS = ["/sdcard/Pictures/Screenshots", "/sdcard/DCIM/Screenshots"]
 EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 CHECK = "Проверить"
+SECRET = "Личное и секретное"
+# Что на скриншоте делает его секретным. Узко: «токен» (крипта) и «seed» (семена подсолнуха) на твоих
+# скриншотах ловили обычное. Полный номер карты — 16 цифр подряд; «**** 1234» в чеках сюда не попадает.
+SECRET_WORDS = re.compile(r"парол|password|код подтвержд|кода подтвержд|(?:смс|sms)[ -]?код|код из (?:смс|sms)|"
+                          r"одноразов\w* код|verification code|login code|cvv|cvc|пин-код|pin[ -]код|"
+                          r"seed[ -]phrase|сид-фраз|секретн\w* (?:фраз|ключ|слов)|резервн\w* код|recovery code|"
+                          r"api[ -]?key|api-ключ|паспорт|passport", re.I)
+CARD_NUMBER = re.compile(r"(?<!\d)(?:\d{4}[ -]?){3}\d{4}(?!\d)")
 OTHER = "Разное"
 DEV = [
     "Разработка/GitHub-репозитории",
@@ -57,7 +66,7 @@ DEV = [
 DEFAULT_TOPICS = DEV + [
     "Переписки", "Контакты и звонки", "Банк и платежи", "Покупки и заказы", "Документы и справки",
     "Соцсети и посты", "Видео и музыка", "Карты и адреса", "Мемы и картинки",
-    "Учёба и статьи", "Настройки телефона", OTHER,
+    "Учёба и статьи", "Настройки телефона", SECRET, OTHER,
 ]
 KINDS = ["github_repo", "skill", "mcp_server", "ai_tool", "dev_tool", "url"]
 KIND_TITLES = {
@@ -80,13 +89,15 @@ TOPIC_HINTS = {
         "Telegram, WhatsApp), экран звонка, журнал вызовов",
     "Банк и платежи": "переводы, чеки, балансы, банковские приложения, оплата, курсы валют",
     "Покупки и заказы": "товары, цены, корзина, заказы, доставка, маркетплейсы",
-    "Документы и справки": "паспорт, справки, билеты, договоры, госуслуги, официальные бумаги",
+    "Документы и справки": "справки, билеты, договоры, госуслуги, официальные бумаги",
     "Соцсети и посты": "посты, сторис, профили, комментарии (Instagram, Telegram-каналы, X, TikTok) не про разработку",
     "Видео и музыка": "плееры, YouTube, фильмы, песни, кадры из видео",
     "Карты и адреса": "карты, маршруты, адреса, геолокация, такси",
     "Мемы и картинки": "мемы, юмор, красивые картинки, обои",
     "Учёба и статьи": "статьи, учебные материалы, курсы, новости, инструкции не про разработку",
     "Настройки телефона": "системные экраны Android, настройки, уведомления, системные ошибки",
+    SECRET: "пароли, коды из SMS, полный номер карты с CVV, паспорт и другие документы с личными данными, "
+        "ключи и секретные фразы — то, что опасно случайно переслать",
     OTHER: "ничего из перечисленного не подходит",
 }
 
@@ -107,6 +118,7 @@ topic — ровно одна тема из списка:
 Как выбирать тему:
 1. Решай по главному содержимому, а не по приложению. Пост в Telegram про перевод денег — «Банк и платежи».
    Карточка или профиль человека с номером, экран звонка — «Контакты и звонки», а не «Переписки»: переписка — это когда видны сообщения.
+   Пароль, код из SMS, полный номер карты, CVV, паспорт, секретная фраза или ключ на экране — «Личное и секретное», даже если это чат или банк.
 2. Разработка важнее всего: если главное на экране — программирование, ИИ, репозиторий, скил или MCP, выбирай «Разработка/…», даже если это пост в соцсети, переписка или видео.
 3. Если подходит несколько тем «Разработка/…», бери самую конкретную в таком порядке: MCP-серверы, Claude скилы и плагины, GitHub-репозитории, AI-инструменты и модели, Код и ошибки, Другие инструменты.
 
@@ -127,6 +139,10 @@ entities — всё про разработку и ИИ, что видно на 
   dev_tool — программа, библиотека, пакет, CLI для разработки;
   url — любая другая ссылка, видимая на экране.
   name — точно как на экране. url — только если ссылка видна на экране, или для github_repo, когда виден owner/repo (https://github.com/owner/repo); иначе пустая строка.
+
+phones — номера телефонов, которые видны на экране (если нет — пустой список):
+  number — цифры как на экране, вместе с «+» и кодом страны, если они видны;
+  name — имя человека или компании рядом с номером, как на экране; если имени нет — пустая строка.
 
 confidence — насколько ты уверен в теме:
   0.95 — тема очевидна; 0.8 — уверен, но есть похожая тема; 0.6 — колеблешься между двумя; 0.4 и ниже — не понял, что на экране.
@@ -154,9 +170,11 @@ def schema(topics):
                 "kind": {"type": "string", "enum": KINDS},
                 "name": {"type": "string"}, "url": {"type": "string"}},
                 "required": ["kind", "name", "url"]}},
+            "phones": {"type": "array", "maxItems": 5, "items": {"type": "object", "properties": {
+                "name": {"type": "string"}, "number": {"type": "string"}}, "required": ["name", "number"]}},
             "confidence": {"type": "number"},
         },
-        "required": ["app", "seen", "topic", "title", "description", "keywords", "entities", "confidence"],
+        "required": ["app", "seen", "topic", "title", "description", "keywords", "entities", "phones", "confidence"],
     }
 
 
@@ -371,6 +389,16 @@ def hints_block():
 
 
 _rules = (None, [])
+_groups = (None, {})
+
+
+def same_screens():
+    """{sha: [тема большинства, сколько таких же]} — пересчитывает app после каждой раскладки."""
+    global _groups
+    mtime = GROUPS.stat().st_mtime if GROUPS.exists() else 0
+    if _groups[0] != mtime:
+        _groups = (mtime, load_json(GROUPS, {}))
+    return _groups[1]
 
 
 def word_rules():
@@ -480,6 +508,14 @@ def final(r, topic_list):
     elif max(x["confidence"] for x in (fast, strong) if x) < 0.7:
         topic = CHECK
     why = ""
+    # Почти одинаковые экраны — туда же, куда большинство таких же (нейросеть иногда кладёт их по-разному)
+    group = same_screens().get(r["sha"])
+    if group and group[0] in topic_list and topic != CHECK:
+        topic, why = group[0], f"как такие же экраны ({group[1]} шт.)"
+    # Секретное: пароль, код, полный номер карты, паспорт — отдельно, чтобы случайно не переслать
+    said_all = " ".join([best.get("title", ""), best.get("description", ""), best.get("seen", "")] + best.get("keywords", []))
+    if SECRET in topic_list and (m := SECRET_WORDS.search(said_all) or CARD_NUMBER.search(said_all)):
+        topic, why = SECRET, "секретное: " + ("номер карты" if m.re is CARD_NUMBER else m.group(0).lower())
     # Правило со словами: в названии или ключевых словах разбора есть слово из подсказки — сразу в её папку
     said = " ".join([best.get("title", "")] + best.get("keywords", []))
     for pat, rule_topic, words in word_rules():
@@ -654,6 +690,56 @@ def write_index(rows):
         w = csv.writer(f)
         w.writerow(["файл", "тема", "название", "описание", "ключевые слова", "уверенность", "исходник"])
         w.writerows(rows)
+
+
+CONTACT_TOPIC = "Контакты и звонки"
+CONTACT_WORDS = re.compile(r"звон|вызов|контакт|номер телефона|абонент", re.I)  # старые разборы без поля phones
+PHONE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+NAME_AFTER = re.compile(r"(?:\bот|[Кк]онтакт|[Пп]рофиль|[Вв]ызов|[Зз]вонок)\s+(?!на\b|по\b|с\b|номер)([А-ЯЁA-Z][^,;|]*?)"
+                        r"(?=\s+(?:в|на|из|с)\s|\s*[,;|]|$)")
+
+
+def phone_key(raw):
+    """Номер для телефонной книги. 9 цифр — мобильный Таджикистана без кода: добавляем +992."""
+    digits = re.sub(r"\D", "", raw)
+    if not 9 <= len(digits) <= 13:  # короче — обрывок, длиннее — склеенные цифры, а не номер
+        return None
+    if len(digits) == 9:
+        return "+992" + digits
+    if raw.strip().startswith("+") or (len(digits) == 12 and digits.startswith("992")):
+        return "+" + digits
+    return digits
+
+
+def contacts(topic_list=None):
+    """Номера со всех скриншотов: из поля phones (новые разборы) или из текста скриншотов в «Контактах и звонках»."""
+    topic_list = topic_list or topics()
+    book = {}
+    for r in load_results().values():
+        f = final(r, topic_list) if r.get("fast") else None
+        if not f:
+            continue
+        found = [(p.get("name", ""), p.get("number", "")) for p in f.get("phones", [])]
+        if not found and (f["topic"] == CONTACT_TOPIC or CONTACT_WORDS.search(f["title"])):
+            text = " ".join([f["title"], f.get("seen", ""), f.get("description", "")])
+            m = NAME_AFTER.search(f["title"])
+            found = [(m.group(1).strip() if m else "", n) for n in PHONE.findall(text)]
+        for name, number in found:
+            key = phone_key(number)
+            if key and (key not in book or len(name) > len(book[key])):
+                book[key] = name.strip()
+    return book
+
+
+def write_vcf(book, path=None):
+    path = path or ROOT / "Контакты.vcf"
+    cards = []
+    for number, name in sorted(book.items(), key=lambda kv: (kv[1] == "", kv[1].lower())):
+        fn = (name or number).replace("\\", "").replace(";", ",")
+        cards.append(f"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{fn}\r\nN:{fn};;;;\r\nTEL;TYPE=CELL:{number}\r\n"
+                     f"NOTE:Найдено на скриншоте (Разбор скриншотов)\r\nEND:VCARD\r\n")
+    path.write_text("".join(cards), encoding="utf-8")
+    return path
 
 
 def write_dev(ents):

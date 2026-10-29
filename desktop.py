@@ -47,6 +47,11 @@ def selftest():
         from PIL import Image
         v = similar.embed([Image.new("RGB", (100, 200), "white")])
         assert v.shape == (1, 768), f"вектор {v.shape}"
+    if similar.text_ready():  # поиск по смыслу: токенизатор и текстовая модель
+        t = similar.text_vector("экран звонка")
+        assert t.shape == (768,), f"вектор текста {t.shape}"
+    else:
+        import tokenizers  # noqa: F401  библиотека должна быть в сборке, даже если модель ещё не скачана
     print("selftest ok:", snap["phase"], "root =", snap["root"], "ollama =", snap["setup"], "похожие =", snap["similar"])
 
 

@@ -1,6 +1,7 @@
 """Поиск похожих скриншотов: маленькая модель SigLIP 2 превращает картинку в «отпечаток» (вектор),
 по нему находятся примеры, которые владелец уже исправил или выделил. Работает на процессоре."""
 import threading
+from collections import Counter
 
 import numpy as np
 from PIL import Image
@@ -9,6 +10,10 @@ import sortshots as S
 
 REPO = "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/onnx/"
 MODEL = S.APP_DATA / "models" / "siglip2" / "vision_model.onnx"
+# Текстовая половина той же модели: запрос словами → вектор в том же пространстве, что и картинки.
+# int8 (270 МБ вместо 1.1 ГБ): на поиске по скриншотам разницы не видно.
+TEXT_MODEL = MODEL.with_name("text_model_int8.onnx")
+TOKENIZER = MODEL.with_name("tokenizer.json")
 VECTORS = S.DATA / "vectors.npz"  # отпечатки уже посчитанных картинок: ключ → вектор
 SIDE = 224
 # Куски скриншота, в которых ищется выделенный образец: трети по высоте и середина
@@ -29,10 +34,15 @@ def ready():
     return MODEL.exists()
 
 
+def text_ready():
+    return TEXT_MODEL.exists() and TOKENIZER.exists()
+
+
 def fetch(progress=None):
-    if not MODEL.exists():
-        MODEL.parent.mkdir(parents=True, exist_ok=True)
-        S.download(REPO + "vision_model.onnx", MODEL, progress)
+    for url, dest in ((REPO + "vision_model.onnx", MODEL), (REPO + "text_model_int8.onnx", TEXT_MODEL),
+                      (REPO.replace("onnx/", "tokenizer.json"), TOKENIZER)):
+        if not dest.exists():
+            S.download(url, dest, progress)
 
 
 def session():
@@ -44,6 +54,41 @@ def session():
             opts.intra_op_num_threads = 4  # не забирать весь процессор у остальной системы
             _sess = ort.InferenceSession(str(MODEL), opts, providers=["CPUExecutionProvider"])
         return _sess
+
+
+_text = None
+
+
+def text_vector(query):
+    """Запрос словами → вектор. Как у SigLIP 2: нижний регистр, <eos> в конце, добивка до 64 токенов."""
+    global _text
+    with _lock:
+        if _text is None:
+            import onnxruntime as ort
+            from tokenizers import Tokenizer
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = 4
+            _text = (Tokenizer.from_file(str(TOKENIZER)),
+                     ort.InferenceSession(str(TEXT_MODEL), opts, providers=["CPUExecutionProvider"]))
+    tok, sess = _text
+    eos, pad = tok.token_to_id("<eos>"), tok.token_to_id("<pad>")
+    ids = [i for i in tok.encode(query.lower()).ids if i != eos][:63] + [eos]
+    ids += [pad] * (64 - len(ids))
+    v = sess.run(None, {"input_ids": np.array([ids], dtype=np.int64)})[1][0]
+    return v / np.linalg.norm(v)
+
+
+def by_meaning(query, shas):
+    """Сходство запроса с каждым скриншотом, у которого уже есть вектор: {sha: сходство}."""
+    if not (ready() and text_ready()):
+        return {}
+    vs = _load()
+    with _vec_lock:
+        have = [(s, vs["shot:" + s]) for s in shas if "shot:" + s in vs]
+    if not have:
+        return {}
+    sims = np.stack([v for _, v in have]).astype(np.float32) @ text_vector(query)
+    return {s: float(x) for (s, _), x in zip(have, sims)}
 
 
 def embed(images):
@@ -201,3 +246,48 @@ def similar_shots(sha, by, done, threshold=QUEUE_SIM):
         return []
     sims = np.stack([c[1] for c in cand]).astype(np.float32) @ v
     return [cand[i][0] for i in np.flatnonzero(sims >= threshold)]
+
+
+SAME_GROUP = 0.98  # почти одинаковые экраны: тот же набор номера, тот же калькулятор
+
+
+def majority(topic_of, voters=None, min_share=0.6):
+    """Почти одинаковые экраны должны лежать в одной папке. topic_of — {sha: тема от нейросети},
+    voters — чьё мнение считать (без тех, кто ждёт переразбора: их тема устарела).
+    Решение на всю группу сразу, иначе одни переезжают туда, другие оттуда.
+    Вернёт {sha: (тема группы, размер группы)} для тех, кто лежит не так, как группа."""
+    vs = _load()
+    with _vec_lock:
+        have = [(s, vs["shot:" + s]) for s in topic_of if "shot:" + s in vs]
+    if len(have) < 3:
+        return {}
+    shas = [s for s, _ in have]
+    V = np.stack([v for _, v in have]).astype(np.float32)
+    parent = list(range(len(shas)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i0 in range(0, len(shas), 512):  # кусками: вся матрица на 6000 скриншотов — 140 МБ
+        block = V[i0:i0 + 512] @ V.T
+        for k, row in enumerate(block):
+            for j in np.flatnonzero(row >= SAME_GROUP):
+                a, b = root(i0 + k), root(j)
+                if a != b:
+                    parent[a] = b
+    groups = {}
+    for i, s in enumerate(shas):
+        groups.setdefault(root(i), []).append(s)
+    voters = set(voters if voters is not None else topic_of)
+    out = {}
+    for members in groups.values():
+        votes = Counter(topic_of[s] for s in members if s in voters)
+        if len(members) < 3 or not votes:
+            continue
+        top, n = votes.most_common(1)[0]
+        if n >= min_share * sum(votes.values()):
+            out.update({s: (top, len(members)) for s in members if topic_of[s] != top})
+    return out
