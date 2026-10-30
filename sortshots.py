@@ -8,7 +8,7 @@
   sortshots app      приложение с живым прогрессом и проверкой: http://127.0.0.1:8765
 """
 import argparse, base64, hashlib, io, json, os, random, re, shutil, subprocess, zipfile
-import sys, threading, time, urllib.request, zlib
+import sys, threading, time, urllib.error, urllib.request, zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -32,7 +32,13 @@ EXAMPLES = DATA / "examples"           # вырезанные куски скр�
 # Сходство «тот же экран» (similar.py). На настоящих скриншотах при 0.97 и выше разные темы у пары почти всегда
 # ошибка нейросети (одинаковые экраны набора номера в трёх разных папках), поэтому пример владельца решает сам.
 SAME_SCREEN = 0.97
-CROP_SIDE = 384    # образец до 384 px: около 150 токенов, читается и не раздувает запрос
+CROP_SIDE = 384    # образец до 384 px: читается; Ollama всё равно растянет любую картинку минимум до 1024 токенов
+# Qwen3-VL тратит токен на каждые 32×32 px: 1080×2160 — 2312 токенов и ~5 с на чтение картинки,
+# 900×1800 — ~1600. Меньше 1024 токенов Ollama не даст: картинку она растянет обратно.
+SHOT_PIXELS = int(os.environ.get("SORTSHOTS_PIXELS", 900 * 1800))
+# окно модели: инструкция ~1650 + скриншот ≤ ~1600 + пример 1024 + ответ до 768. Постоянное:
+# с другим окном Ollama перезагружает модель
+NUM_CTX = 5120    # KV-кэш q8_0 пробовали: ответы те же, но на 20 % медленнее, а 4B и так целиком в видеопамяти
 
 WIN = sys.platform == "win32"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if WIN else 0  # на Windows не мигать чёрными окнами консоли
@@ -321,10 +327,15 @@ def find_adb(progress=None):
     return str(exe)
 
 
-def prep_image(path):
+def prep_image(path, pixels=None):
+    """Скриншот для нейросети: не больше pixels точек (и не шире 1080), чтобы мелкий текст читался,
+    а длинный скриншот с прокруткой не съедал всё окно модели."""
     with Image.open(path) as im:
         im = im.convert("RGB")
-        im.thumbnail((1080, 2160))  # мелкий текст (имена репозиториев) должен читаться
+        w, h = im.size
+        k = min(1.0, 1080 / w, ((pixels or SHOT_PIXELS) / (w * h)) ** 0.5)
+        if k < 1:
+            im = im.resize((max(1, round(w * k)), max(1, round(h * k))), Image.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, "JPEG", quality=90)
     return base64.b64encode(buf.getvalue()).decode()
@@ -359,15 +370,21 @@ def small_image(path, side=448):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def examples_messages(similar):
+def examples_messages(similar, image=True):
     """Похожие примеры владельца (их находит similar.nearest) — отдельной парой сообщений перед скриншотом."""
     if not similar:
         return []
+    # картинкой только самый похожий пример: каждая картинка стоит не меньше 1024 токенов,
+    # а остальным хватает текста — тема и пояснение владельца
     images, lines = [], []
     for i, (score, e) in enumerate(similar, 1):
-        images.append(b64_file(DATA / e["crop"]) if e["kind"] == "crop" else small_image(e["path"]))
         what = "кусок скриншота, который выделил владелец" if e["kind"] == "crop" else "похожий скриншот"
-        lines.append(f"Картинка {i} — {what} (сходство {score:.0%})"
+        if i == 1 and image:
+            images.append(b64_file(DATA / e["crop"]) if e["kind"] == "crop" else small_image(e["path"]))
+            head = f"Картинка — {what}"
+        else:
+            head = f"Ещё {what}, без картинки"
+        lines.append(f"{head} (сходство {score:.0%})"
                      + (f": владелец отнёс его к теме «{e['topic']}»" if e.get("topic") else "")
                      + (f". Владелец пояснил: {e['text']}" if e.get("text") else "") + ".")
     return [{"role": "user", "images": images,
@@ -449,8 +466,19 @@ def add_topic(name):
     return t
 
 
-def ask(model, path, topic_list, host=OLLAMA, sha=None, similar=None):
-    user = {"role": "user", "images": [prep_image(path)], "content": "Разбери этот скриншот." + hints_block()}
+def ask(model, path, topic_list, host=OLLAMA, sha=None, similar=None, pixels=None, stats=None):
+    """stats — словарь, куда записать, сколько токенов прочитано и сколько секунд ушло (для замеров)."""
+    try:
+        return _ask(model, path, topic_list, host, sha, similar, pixels, stats, image=True)
+    except urllib.error.HTTPError as e:
+        if e.code != 400 or b"exceeds" not in e.read():
+            raise
+    # не влезло в окно (много правил, вырезка в комментарии): пример без картинки, скриншот поменьше
+    return _ask(model, path, topic_list, host, sha, similar, 736 * 1472, stats, image=False)
+
+
+def _ask(model, path, topic_list, host, sha, similar, pixels, stats, image):
+    user = {"role": "user", "images": [prep_image(path, pixels)], "content": "Разбери этот скриншот." + hints_block()}
     note = load_json(NOTES, {}).get(sha) if sha else None
     if note:
         user["content"] += ("\n\nВладелец уже смотрел этот скриншот и сказал, что прошлый разбор неверный. "
@@ -461,15 +489,19 @@ def ask(model, path, topic_list, host=OLLAMA, sha=None, similar=None):
     body = {
         "model": model, "stream": False, "think": False, "keep_alive": "30m",
         "format": schema(topic_list),
-        "options": {"temperature": 0, "num_ctx": 6144},
+        "options": {"temperature": 0, "num_ctx": NUM_CTX, "num_predict": 768},
         "messages": [  # инструкция в system: Ollama кеширует её между запросами, модель читает только картинку
             {"role": "system", "content": PROMPT.format(topics=topic_lines(topic_list or DEFAULT_TOPICS))},
-            *examples_messages(similar), user],
+            *examples_messages(similar, image and not (note or {}).get("crop")), user],
     }
     req = urllib.request.Request(host + "/api/chat", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
-        out = json.loads(json.loads(r.read())["message"]["content"])
+        resp = json.loads(r.read())
+    out = json.loads(resp["message"]["content"])
+    if stats is not None:
+        stats.update(prompt=resp.get("prompt_eval_count"), answer=resp.get("eval_count"),
+                     seconds=round(resp.get("total_duration", 0) / 1e9, 2))
     out["confidence"] = max(0.0, min(1.0, float(out.get("confidence") or 0)))
     if similar:  # на какие примеры опиралась: нужно, чтобы поймать спор с примером владельца
         out["similar"] = [{"score": sc, "topic": e.get("topic", ""), "kind": e["kind"]} for sc, e in similar]

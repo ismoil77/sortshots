@@ -48,6 +48,9 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python desktop.py --selftest   # быстрая проверка без окна
 .venv/bin/python sortshots.py --help     # то же из командной строки
 .venv/bin/python -m unittest discover -s tests   # проверки без нейросети
+.venv/bin/python bench.py --n 60         # замер: скорость и ответы при разном размере картинки
 ```
+
+Скриншот уходит нейросети уменьшенным до ~900×1800 (`SORTSHOTS_PIXELS`, в точках): так он читается примерно втрое быстрее, чем в полном размере. Из похожих примеров картинкой идёт только один, остальные текстом: Ollama растягивает каждую картинку минимум до 1024 токенов.
 
 GitHub Actions (`.github/workflows/build.yml`) на каждый push проверяет установку на Linux и собирает установщик для Windows (самопроверка `.exe` и тихая установка). Тег `v1.0.0` → релиз с `Sortshots-Setup-1.0.0.exe`. Без GitHub установщик собирается на Linux через Wine: `packaging/build_wine.sh 1.0.0`. Рецепт: `packaging/sortshots.spec` (PyInstaller) и `packaging/installer.iss` (Inno Setup).

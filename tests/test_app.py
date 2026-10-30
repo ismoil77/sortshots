@@ -238,5 +238,34 @@ class SameScreens(unittest.TestCase):
             SIM._vecs = old
 
 
+class ModelInput(unittest.TestCase):
+    def size_of(self, w, h):
+        im = Image.new("RGB", (w, h), "white")
+        path = ROOT / f"big-{w}x{h}.png"
+        im.save(path)
+        import base64, io
+        with Image.open(io.BytesIO(base64.b64decode(S.prep_image(path)))) as out:
+            return out.size
+
+    def test_screenshot_is_shrunk(self):
+        w, h = self.size_of(1080, 2400)
+        self.assertLessEqual(w * h, S.SHOT_PIXELS * 1.01)
+        self.assertAlmostEqual(w / h, 1080 / 2400, places=2)
+
+    def test_long_screenshot_does_not_eat_context(self):
+        w, h = self.size_of(1080, 9000)
+        self.assertLessEqual(w * h, S.SHOT_PIXELS * 1.01)
+
+    def test_small_screenshot_untouched(self):
+        self.assertEqual(self.size_of(400, 800), (400, 800))
+
+    def test_only_first_example_is_an_image(self):
+        ex = [(0.99 - i / 100, {"kind": "shot", "path": S.SRC / "DCIM" / n, "topic": "Контакты и звонки", "text": ""})
+              for i, n in enumerate(["call1.png", "call2.png", "call3.png"])]
+        msg = S.examples_messages(ex)[0]
+        self.assertEqual(len(msg["images"]), 1)
+        self.assertEqual(msg["content"].count("Контакты и звонки"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
