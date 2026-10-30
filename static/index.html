@@ -133,13 +133,13 @@
       <template x-for="g in sugg" :key="g.key">
         <article class="sugg">
           <strong>💡 Похоже, ты учишь меня</strong>
-          <p style="margin:.4rem 0 .6rem">Ты переложил <b x-text="g.moved"></b> скриншота со словом «<b x-text="g.word"></b>» в «<b x-text="g.topic"></b>».
+          <p style="margin:.4rem 0 .6rem">Ты переложил <b x-text="g.moved"></b> скриншота <span x-text="g.app ? 'из приложения' : 'со словом'"></span> «<b x-text="g.app || g.word"></b>» в «<b x-text="g.topic"></b>».
             Ещё <b x-text="g.count"></b> таких лежат в других папках, больше всего в «<span x-text="g.from"></span>». Переложить их и запомнить правило?</p>
           <div class="sugg-row">
             <template x-for="sha in g.examples"><img :src="'/img/' + sha + '?w=160'" alt="" @click="zoom = sha"></template>
           </div>
           <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.6rem">
-            <button style="width:auto;margin:0" @click="acceptSugg(g)" x-text="'Да, все со словом «' + g.word + '» — в «' + g.topic + '»'"></button>
+            <button style="width:auto;margin:0" @click="acceptSugg(g)" x-text="'Да, все ' + (g.app ? 'из «' + g.app : 'со словом «' + g.word) + '» — в «' + g.topic + '»'"></button>
             <button class="secondary outline" style="width:auto;margin:0" @click="dismissSugg(g)">Нет, не надо</button>
           </div>
         </article>
@@ -356,6 +356,12 @@
           </template>
           <input class="pick-input" x-model="hint.own" @keydown.enter.prevent="addWord()" placeholder="своё слово + Enter">
         </div>
+        <div class="picks" x-show="hint.app" style="margin-top:.4rem">
+          <button type="button" class="pick word" :class="hint.allApp && 'on'" @click="hint.allApp = !hint.allApp"
+                  x-text="'всё из приложения «' + hint.app + '»'"></button>
+        </div>
+        <small class="muted" x-show="hint.allApp" style="display:block;margin-top:.3rem"
+               x-text="'Все скриншоты из «' + hint.app + '» лягут в «' + target() + '» — и уже разобранные тоже.'"></small>
         <small class="muted" x-show="hint.picked.length" style="display:block;margin-top:.3rem"
                x-text="'Все скриншоты, где в названии есть «' + hint.picked.join('», «') + '», лягут в «' + target() + '» — и уже разобранные тоже.'"></small>
 
@@ -428,7 +434,7 @@ function app() {
     },
     async acceptSugg(g) {
       const r = await (await fetch('/api/suggestions/accept', { method: 'POST', body: JSON.stringify(g) })).json();
-      this.toast = 'Готово: в «' + g.topic + '» теперь ' + (r.moved || 0) + ' скриншотов со словом «' + g.word + '». Отменить — Ctrl+Z';
+      this.toast = 'Готово: в «' + g.topic + '» теперь ' + (r.moved || 0) + ' скриншотов ' + (g.app ? 'из «' + g.app : 'со словом «' + g.word) + '». Отменить — Ctrl+Z';
       setTimeout(() => this.toast = '', 4000);
       this.loadSugg(); this.refreshFolder();
     },
@@ -524,10 +530,10 @@ function app() {
       const pause = this.s.running && !this.s.paused;
       this.hint = { open: true, sha: f.sha, title: f.title, cur: f.topic || '', why: '', suggest: [], picked: [], own: '',
                     newTitle: '', rename: false, topic: '', newTopic: '', adding: false, text: '', explain: false,
-                    result: '', paused: pause, box: null, drag: null };
+                    result: '', paused: pause, box: null, drag: null, app: '', allApp: false };
       if (pause) await this.post('/api/pause');
       const info = await (await fetch('/api/shot?sha=' + f.sha)).json();
-      if (info.sha === this.hint.sha) Object.assign(this.hint, { title: info.title, cur: info.topic, why: info.why, suggest: info.words });
+      if (info.sha === this.hint.sha) Object.assign(this.hint, { title: info.title, cur: info.topic, why: info.why, suggest: info.words, app: info.app });
     },
     toggleWord(w) {
       const p = this.hint.picked;
@@ -547,7 +553,7 @@ function app() {
     hintMode() {
       const h = this.hint;
       if (h.explain && h.text.trim()) return 'redo';
-      return h.picked.length ? 'all' : 'one';
+      return h.picked.length || h.allApp ? 'all' : 'one';
     },
     saveLabel() {
       const m = this.hintMode(), t = this.target();
@@ -604,11 +610,11 @@ function app() {
       const topic = mode === 'all' || t !== h.cur ? t : '';
       const r = await (await fetch('/api/hints', { method: 'POST', body: JSON.stringify({
         mode, sha: h.sha, text: mode === 'redo' ? h.text : '', title: mode === 'redo' ? '' : h.newTitle.trim(),
-        topic, words: h.picked.join(', '), box: mode === 'redo' ? h.box : null }) })).json();
+        topic, words: h.picked.join(', '), app: h.allApp ? h.app : '', box: mode === 'redo' ? h.box : null }) })).json();
       h.result = !r.ok ? 'Не сохранилось: ' + r.error
         : mode === 'redo' ? (r.running ? '✓ Разберётся заново следующим.' : '✓ Разберётся заново первым, когда нажмёшь «Продолжить разбор».')
                             + (r.queued > 1 ? ' Таких же экранов следом: ' + (r.queued - 1) + '.' : '')
-        : mode === 'all' ? '✓ Запомнено. Сейчас в «' + t + '» по этим словам: ' + (r.moved || 0) + '. Новые скриншоты тоже лягут туда.'
+        : mode === 'all' ? '✓ Запомнено. Сейчас в «' + t + '» по этому правилу: ' + (r.moved || 0) + '. Новые скриншоты тоже лягут туда.'
         : '✓ Переложено' + (topic ? ' в «' + topic + '»' : '') + '.'
           + (r.queued ? ' Таких же экранов среди разобранных: ' + r.queued + ' — разберутся заново по этому примеру.' : '');
       if (r.ok) { this.refreshFolder(); this.loadSugg(); }

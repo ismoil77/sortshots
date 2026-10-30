@@ -26,6 +26,11 @@ SHOTS = {  # имя файла → ответ «нейросети»
                      description="Экран с паролем от сети Wi-Fi"),
     "card.png": dict(topic="Переписки", title="Контакт Алишер Душанбе в Telegram", keywords=["контакт"],
                      seen="Алишер +992 900 11 22 33"),
+    # приложение в имени файла, как у Samsung
+    **{f"Screenshot_2024010{i}_10000{i}_Calculator Plus.png": dict(topic="Разработка/Другие инструменты",
+       title=f"Вычисление {i}×16 на калькуляторе", keywords=["калькулятор"]) for i in range(1, 5)},
+    "Screenshot_20240105_100005_DC Wallet.png": dict(topic="Банк и платежи", title="Код подтверждения в DC Wallet",
+                                                      keywords=["код подтверждения"]),
 }
 ASKED = []
 
@@ -236,6 +241,63 @@ class SameScreens(unittest.TestCase):
             self.assertEqual(g, {sha_of("call1.png"): ("Контакты и звонки", 3)})
         finally:
             SIM._vecs = old
+
+
+class Learning(unittest.TestCase):
+    def test_classifier_learns_from_labels(self):
+        rng = np.random.default_rng(0)
+        centers = {"Банк и платежи": rng.normal(size=768), "Покупки и заказы": rng.normal(size=768)}
+        vecs, labels = {}, {}
+        for topic, c in centers.items():
+            for i in range(12):
+                v = c + rng.normal(scale=0.3, size=768)
+                vecs[f"shot:{topic}{i}"] = (v / np.linalg.norm(v)).astype(np.float32)
+                labels[f"{topic}{i}"] = topic
+        v = centers["Покупки и заказы"] + rng.normal(scale=0.3, size=768)
+        vecs["shot:" + sha_of("money.png")] = (v / np.linalg.norm(v)).astype(np.float32)
+        old = SIM._vecs
+        SIM._vecs = vecs
+        try:
+            S.save_json(S.LABELS, labels)
+            guess = SIM.learn()[sha_of("money.png")]
+            self.assertEqual(guess[0], "Покупки и заказы")
+            r = topic_of("money.png")
+            self.assertEqual((r["topic"], r["why"][:11]), ("Покупки и заказы", "по обучению"))
+            S.save_json(S.LABELS, {sha_of("money.png"): "Банк и платежи"})  # меньше 20 примеров — не учится
+            self.assertEqual(SIM.learn(), {})
+            self.assertEqual(topic_of("money.png")["why"], "по разметке")
+        finally:
+            SIM._vecs = old
+            S.LABELS.unlink()
+            S.save_json(S.LEARNED, {})
+
+
+class AppRules(unittest.TestCase):
+    def calc(self, i):
+        return sha_of(f"Screenshot_2024010{i}_10000{i}_Calculator Plus.png")
+
+    def test_app_from_file_name(self):
+        self.assertEqual(S.app_of("DCIM/Screenshots/Screenshot_20240402_130343_Calculator Plus~2.jpg"), "Calculator Plus")
+        self.assertEqual(S.app_of("DCIM/Screenshots/20240829_093152~2.jpg"), "")
+
+    def test_suggest_app_rule_after_three_moves_then_undo(self):
+        for i in (1, 2, 3):
+            post("/api/set", {"sha": self.calc(i), "topic": "Разное"})
+        sugg = [g for g in get("/api/suggestions") if g.get("app")]
+        self.assertEqual([(g["app"], g["topic"], g["count"]) for g in sugg], [("Calculator Plus", "Разное", 1)])
+        r = post("/api/suggestions/accept", sugg[0])
+        self.assertTrue(r["ok"])
+        f = topic_of("Screenshot_20240104_100004_Calculator Plus.png")
+        self.assertEqual((f["topic"], f["why"]), ("Разное", "из приложения Calculator Plus"))
+        for _ in range(4):
+            post("/api/undo")
+        self.assertEqual(topic_of("Screenshot_20240104_100004_Calculator Plus.png")["topic"], "Разработка/Другие инструменты")
+
+    def test_secret_beats_app_rule(self):
+        app.W.add_new_topics()
+        self.assertTrue(post("/api/suggestions/accept", {"topic": "Банк и платежи", "app": "DC Wallet"})["ok"])
+        self.assertEqual(topic_of("Screenshot_20240105_100005_DC Wallet.png")["topic"], S.SECRET)
+        post("/api/undo")
 
 
 class ModelInput(unittest.TestCase):

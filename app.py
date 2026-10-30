@@ -252,6 +252,10 @@ class Worker:
             S.save_json(S.GROUPS, {k: list(v) for k, v in groups.items()})
         except Exception as e:
             self.errors.append(f"одинаковые экраны: {e}")
+        try:
+            SIM.learn()  # исправления сразу учат классификатор
+        except Exception as e:
+            self.errors.append(f"обучение: {e}")
 
     def run_pass(self, todo, model, stage, topics, workers, label=None, after=None):
         self.phase = stage
@@ -415,7 +419,7 @@ class Worker:
 
     # ---- подсказки ----
 
-    def add_hint(self, mode, text, topic, words, sha, title=None, box=None):
+    def add_hint(self, mode, text, topic, words, sha, title=None, box=None, app=""):
         """mode: one — поправить только этот скриншот вручную; redo — переразобрать его с комментарием;
         all — запомнить правило (и образец, если выделена часть картинки) для всех следующих."""
         if topic and topic != S.CHECK:  # новая папка сразу становится темой
@@ -428,14 +432,17 @@ class Worker:
         if mode == "one":
             return {"ok": True, "queued": queued}
         hid = int(time.time() * 1000)
-        text = text.strip() or (f"Скриншоты со словами: {words.strip()}" if words.strip() else "")
+        text = text.strip() or (f"Скриншоты со словами: {words.strip()}" if words.strip() else "") or (
+            f"Скриншоты из приложения {app}" if app else "")
         hint = {"id": hid, "text": text, "topic": topic or "", "words": words.strip(),
                 "sha": sha or "", "created": time.strftime("%Y-%m-%d %H:%M")}
+        if app and topic:
+            hint["app"] = app
         if box and sha in self.by:
             hint["crop"] = S.save_crop(self.by[sha], box, f"hint_{hid}")
         S.save_json(S.HINTS, S.load_json(S.HINTS, []) + [hint])
         pat = S.words_pattern(words)
-        if pat and topic:  # правило со словами и папкой работает без нейросети: разложить заново, и всё
+        if (pat or hint.get("app")) and topic:  # правило со словами или приложением и папкой работает без нейросети: разложить заново, и всё
             with self.lock:
                 moved = sum(1 for r in self.res.values() if r.get("fast") and S.final(r, S.topics())["topic"] == topic)
             self.place(force=True)
@@ -505,7 +512,27 @@ class Worker:
                                  "examples": rest[:6]})
             if best:  # одно предложение на папку: слово, которое найдёт больше всего
                 out.append(max(best, key=lambda x: (x["moved"], x["count"], len(x["word"]))))
+        out += self.app_suggestions(moved, shots, dismissed)
         return sorted(out, key=lambda x: -x["count"])[:3]
+
+    def app_suggestions(self, moved, shots, dismissed):
+        """Переложил в одну папку 3+ скриншота из одного приложения (калькулятор, телефон) и почти все
+        исправления этого приложения туда — предложить отправлять туда всё из него."""
+        apps = {sha: S.app_of(self.res[sha]["src"]) for sha in shots}
+        fixed = Counter(apps[sha] for shas in moved.values() for sha in shas)
+        have = {(h.get("topic"), h.get("app")) for h in S.load_json(S.HINTS, []) if h.get("app")}
+        out = []
+        for target, shas in moved.items():
+            for app, n in Counter(apps[sha] for sha in shas).items():
+                if not app or n < 3 or n < fixed[app] * 0.9 or (target, app) in have \
+                        or f"{target}|app:{app}" in dismissed:
+                    continue
+                rest = [sha for sha, a in apps.items() if a == app and shots[sha]["topic"] != target]
+                if rest:
+                    out.append({"key": f"{target}|app:{app}", "app": app, "word": "", "topic": target, "moved": n,
+                                "count": len(rest), "from": Counter(shots[x]["topic"] for x in rest).most_common(1)[0][0],
+                                "examples": rest[:6]})
+        return out
 
     def dismiss(self, key):
         st = S.load_json(SETTINGS, {"strong": True})
@@ -618,7 +645,7 @@ class Worker:
         if not f:
             return None
         return {"sha": sha, "title": f["title"], "topic": f["topic"], "why": f.get("why", ""),
-                "words": suggest_words([f["title"], f.get("app", "")] + f.get("keywords", []))}
+                "app": S.app_of(r["src"]), "words": suggest_words([f["title"], f.get("app", "")] + f.get("keywords", []))}
 
     def set_topic(self, sha, topic=None, title=None):
         """Ручное исправление одного скриншота: папка и/или название."""
@@ -785,16 +812,18 @@ class H(BaseHTTPRequestHandler):
             if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)
                     and box[2] > 0.01 and box[3] > 0.01):
                 box = None  # случайный клик вместо выделения
-            if mode == "all" and not ((body.get("text") or "").strip() or box or (body.get("words") or "").strip()):
+            if mode == "all" and not ((body.get("text") or "").strip() or box or (body.get("words") or "").strip()
+                                      or (body.get("app") and body.get("topic"))):
                 return self.send({"ok": False, "error": "напиши, что запомнить"}, code=400)
             if mode == "redo" and not ((body.get("text") or "").strip() or body.get("topic")):
                 return self.send({"ok": False, "error": "напиши, что на скриншоте на самом деле"}, code=400)
             W.remember({"one": "исправление скриншота", "redo": "переразбор с объяснением"}.get(mode, "правило"))
             return self.send(W.add_hint(mode, body.get("text") or "", body.get("topic"), body.get("words") or "",
-                                        body.get("sha"), body.get("title"), box))
+                                        body.get("sha"), body.get("title"), box, body.get("app") or ""))
         if p == "/api/suggestions/accept":
-            W.remember("правило «" + body["word"] + "»")
-            return self.send(W.add_hint("all", "", body["topic"], body["word"], "", None, None))
+            W.remember("правило «" + (body.get("word") or body.get("app", "")) + "»")
+            return self.send(W.add_hint("all", "", body["topic"], body.get("word") or "", "", None, None,
+                                        body.get("app") or ""))
         if p == "/api/suggestions/dismiss":
             W.dismiss(body["key"])
             return self.send({"ok": True})

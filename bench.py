@@ -24,14 +24,25 @@ def sample(n, seed=1):
     return out
 
 
+def listed(path):
+    res, out = S.load_results(), []
+    for x in json.load(open(path, encoding="utf-8")):
+        sha = x["sha"] if isinstance(x, dict) else x
+        if res.get(sha, {}).get("fast"):
+            out.append((sha, S.SRC / res[sha]["src"], res[sha]["fast"]))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=60)
     ap.add_argument("--pixels", default="1080x2160,900x1800,736x1472")
     ap.add_argument("--model", default=S.FAST)
+    ap.add_argument("--shas", help="JSON-файл со списком скриншотов ({sha} или sha) вместо случайной выборки")
+    ap.add_argument("--name", default="", help="приписка к имени файла с ответами")
     a = ap.parse_args()
     S.ensure_ollama()
-    shots, topic_list = sample(a.n), S.topics()
+    shots, topic_list = (listed(a.shas) if a.shas else sample(a.n)), S.topics()
     out_dir = S.DATA / "bench"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"{len(shots)} скриншотов, тем {len({f['topic'] for *_, f in shots})}")
@@ -41,7 +52,7 @@ def main():
         w, h = map(int, size.split("x"))
         S.NUM_CTX = 6144 if w * h > 1.5e6 else ctx  # полный размер — со старым окном, как было до уменьшения
         same, secs, toks, t0 = 0, [], [], time.time()
-        with open(out_dir / f"{a.model.replace(':', '-')}-{size}.jsonl", "w", encoding="utf-8") as f:
+        with open(out_dir / f"{a.model.replace(':', '-')}-{size}{a.name}.jsonl", "w", encoding="utf-8") as f:
             for sha, p, old in shots:
                 st = {}
                 try:
@@ -53,7 +64,7 @@ def main():
                 secs.append(st["seconds"])
                 toks.append(st["prompt"] or 0)
                 f.write(json.dumps({"sha": sha, "src": str(p.relative_to(S.SRC)), "old": old["topic"],
-                                    "old_title": old["title"], "new": new["topic"], "new_title": new["title"], **st},
+                                    "old_title": old["title"], "new": new["topic"], "new_title": new["title"], "answer": new, "stats": st},
                                    ensure_ascii=False) + "\n")
         n = len(secs) or 1
         line = (f"{size}: та же тема {same}/{len(secs)} ({same / n:.0%}), {sum(secs) / n:.1f} с/шт, "
