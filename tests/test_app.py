@@ -272,6 +272,40 @@ class Learning(unittest.TestCase):
             S.save_json(S.LEARNED, {})
 
 
+    def test_app_name_teaches_too(self):
+        rng = np.random.default_rng(1)
+        c = rng.normal(size=768)  # картинки одинаковые, отличает только приложение
+        vec = lambda: (lambda v: (v / np.linalg.norm(v)).astype(np.float32))(c + rng.normal(scale=0.3, size=768))
+        vecs = {f"shot:{a}{i}": vec() for a in "ab" for i in range(13)}
+        labels = {f"{a}{i}": t for a, t in (("a", "Банк и платежи"), ("b", "Разное")) for i in range(12)}
+        apps = {f"{a}{i}": n for a, n in (("a", "Bank"), ("b", "Calculator")) for i in range(13)}
+        old = SIM._vecs
+        SIM._vecs = vecs
+        try:
+            S.save_json(S.LABELS, labels)
+            out = SIM.learn(apps)
+            self.assertEqual((out["a12"][0], out["b12"][0]), ("Банк и платежи", "Разное"))
+        finally:
+            SIM._vecs = old
+            S.LABELS.unlink()
+            S.save_json(S.LEARNED, {})
+
+    def test_sorted_before_the_model_and_strong_only_for_dev(self):
+        r = {"sha": "x", "src": "DCIM/Screenshot_20240101_100001_Calculator Plus.png"}
+        dev = dict(r, fast=answer("Репозиторий", "Разработка/GitHub-репозитории"))
+        try:
+            self.assertIsNone(S.final(r, S.topics()))
+            self.assertTrue(S.needs_strong(dev, S.topics()))
+            S.save_json(S.LEARNED, {"x": ["Разное", 0.9]})
+            f = S.final(r, S.topics())  # нейросеть ещё не смотрела, а папка уже есть
+            self.assertEqual((f["topic"], f["title"], f["why"][:11]), ("Разное", "Calculator Plus", "по обучению"))
+            self.assertFalse(S.needs_strong(dev, S.topics()))  # классификатор уверен, что это не разработка
+            S.save_json(S.LEARNED, {"x": ["Разработка/GitHub-репозитории", 0.9]})
+            self.assertTrue(S.needs_strong(dev, S.topics()))
+        finally:
+            S.save_json(S.LEARNED, {})
+
+
 class AppRules(unittest.TestCase):
     def calc(self, i):
         return sha_of(f"Screenshot_2024010{i}_10000{i}_Calculator Plus.png")

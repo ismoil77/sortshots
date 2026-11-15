@@ -37,7 +37,7 @@ class Worker:
         self.setup = {"ollama": "проверяю"}
         self.res = S.load_results()
         self.by = dict(S.index_sources()) if S.SRC.exists() else {}
-        self.last_place = 0
+        self.last_place = self.place_secs = 0
         self.last_groups = 0
         self.skip = set()  # не разобрались из-за ошибки в этом запуске
         self.done_since_save = 0
@@ -72,7 +72,7 @@ class Worker:
                 "models": self.models, "phone": self.phone, "setup": self.setup, "similar": self.sim_status, "windows": S.WIN,
                 "errors": list(self.errors)[::-1],
                 "root": str(S.ROOT), "topics": topics,
-                "settings": S.load_json(SETTINGS, {"strong": True}),
+                "settings": settings(),
                 "queue": len(S.load_json(S.QUEUE, [])), "hints": S.load_json(S.HINTS, []),
                 "undo": (S.load_json(UNDO, []) or [{}])[-1].get("label"),
             }
@@ -86,7 +86,7 @@ class Worker:
     def eta(self, fast_done, strong_need, strong_done):
         left_fast = len(self.by) - fast_done + len(S.load_json(S.QUEUE, []))
         minutes = left_fast * (self.speed("fast") or 4.0)
-        if S.load_json(SETTINGS, {"strong": True})["strong"]:
+        if settings()["strong"]:
             share = strong_need / fast_done if fast_done else 0.3  # какая доля уйдёт на перепроверку
             minutes += (strong_need - strong_done + left_fast * share) * (self.speed("strong") or 40.0)
         return round(minutes / 60, 1)
@@ -210,13 +210,16 @@ class Worker:
     # ---- разбор ----
 
     def place(self, force=False):
-        if not force and time.time() - self.last_place < 3:
+        # не чаще раза в 3 с и так, чтобы раскладка занимала не больше десятой части времени разбора
+        if not force and time.time() - self.last_place < max(3, 10 * self.place_secs):
             return
         with self.place_lock:
-            if force or time.time() - self.last_groups > 60:
+            t0 = time.time()
+            if force or t0 - self.last_groups > 60:
                 self.update_groups()
             S.place(verbose=False)
             self.last_place = time.time()
+            self.place_secs = self.last_place - t0
             placed = S.load_placed()
             with self.lock:
                 for r in self.recent:
@@ -253,7 +256,7 @@ class Worker:
         except Exception as e:
             self.errors.append(f"одинаковые экраны: {e}")
         try:
-            SIM.learn()  # исправления сразу учат классификатор
+            SIM.learn({sha: S.app_of(p.name) for sha, p in self.by.items()})  # исправления сразу учат классификатор
         except Exception as e:
             self.errors.append(f"обучение: {e}")
 
@@ -327,26 +330,28 @@ class Worker:
             self.pull(S.FAST)
             self.fetch_similar()
             strong = threading.Thread(target=self.pull, args=(S.STRONG,), daemon=True)
-            strong.start()  # сильная модель докачивается, пока работает быстрая
+            if settings()["strong"]:  # выключена — 6 ГБ не качаем
+                strong.start()  # сильная модель докачивается, пока работает быстрая
             topics = S.topics()
             self.by = dict(S.index_sources())
             if not self.by:
                 raise RuntimeError("Скриншотов нет: выбери папку или скопируй их с телефона")
             self.skip = set()
+            self.quick_sort()
             while True:
                 # на 6 ГБ видеокарты параллельно только медленнее; очередь по подсказкам идёт первой
                 self.run_pass(self.fast_todo(), S.FAST, "fast", topics, 1, after=self.requeued)
                 if self.stop.is_set():
                     return
                 self.place(force=True)
-                if not S.load_json(SETTINGS, {"strong": True})["strong"]:
+                if not settings()["strong"]:
                     if self.queue_left():
                         continue
                     self.phase, self.msg = "done", "Готово (без перепроверки сильной моделью)."
                     return
                 if self.models.get(S.STRONG, {}).get("status") != "готова":
                     self.phase, self.msg = "models", "Жду, пока докачается сильная модель"
-                    strong.join()
+                    strong.join() if strong.is_alive() else self.pull(S.STRONG)  # включили уже во время разбора
                 topics = S.topics()
                 todo = [(s, self.by[s]) for s, r in list(self.res.items()) if s in self.by and S.needs_strong(r, topics)]
                 self.run_pass(todo, S.STRONG, "strong", topics, 1)
@@ -368,9 +373,39 @@ class Worker:
                 self.phase, self.msg = "idle", "Остановлено. Продолжить можно в любой момент."
             self.current.clear()
 
+    def quick_sort(self):
+        """Сначала быстро разложить всё по самой картинке: её вектор считается ~0.2 с на процессоре,
+        папку выбирает классификатор. Нейросеть потом допишет названия. Только когда классификатору
+        уже есть на чём учиться (разметка или 20+ исправлений): иначе раскладывать нечем."""
+        if not SIM.ready() or not S.learned():
+            return
+        todo = [(s, p) for s, p in self.by.items() if s not in self.res]
+        self.phase = "quick"
+        for i, (sha, p) in enumerate(todo, 1):
+            while self.pause.is_set() and not self.stop.is_set():
+                time.sleep(0.3)
+            if self.stop.is_set():
+                break
+            self.msg = f"быстрая раскладка по картинке: {i} из {len(todo)}"
+            try:
+                SIM.shot_vector(sha, p)
+            except Exception as e:  # битый файл: до него дойдёт (и запишет ошибку) обычный разбор
+                self.errors.append(f"{p.name}: {e}")
+                continue
+            rec = {"sha": sha, "src": p.relative_to(S.SRC).as_posix()}
+            S.append_result(rec)
+            with self.lock:
+                self.res[sha] = rec
+            if i % 100 == 0:
+                self.save_vectors()
+                self.place(force=True)
+        if todo:
+            self.save_vectors()
+            self.place(force=True)
+
     def add_new_topics(self):
         """Темы, которые появились в новой версии, добавить к своим один раз (если удалишь — не вернутся)."""
-        st = S.load_json(SETTINGS, {"strong": True})
+        st = settings()
         added = st.get("topics_added", [])
         for t in (S.SECRET,):
             if t not in added:
@@ -535,7 +570,7 @@ class Worker:
         return out
 
     def dismiss(self, key):
-        st = S.load_json(SETTINGS, {"strong": True})
+        st = settings()
         S.save_json(SETTINGS, dict(st, dismissed=st.get("dismissed", []) + [key]))
 
     # ---- отмена ----
@@ -659,6 +694,10 @@ class Worker:
         ov[sha] = cur
         S.save_json(S.OVERRIDES, ov)
         self.place(force=True)
+
+
+def settings():
+    return S.load_json(SETTINGS, {"strong": True})
 
 
 W = None

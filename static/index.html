@@ -461,7 +461,7 @@ function app() {
     phaseLabel() {
       if (this.s.paused) return 'на паузе';
       return { idle: 'ожидает', phone: 'копирует с телефона', models: 'готовит модели', fast: 'разбирает',
-               strong: 'перепроверяет', place: 'раскладывает', done: 'готово', error: 'ошибка' }[this.s.phase] || this.s.phase;
+               quick: 'быстрая раскладка', strong: 'перепроверяет', place: 'раскладывает', done: 'готово', error: 'ошибка' }[this.s.phase] || this.s.phase;
     },
     ollamaLabel() {
       return { 'проверяю': 'проверяю…', 'нет': 'не установлена', 'качается': 'скачивается ' + (this.s.setup.pct || 0) + '%',

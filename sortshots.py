@@ -50,7 +50,6 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if WIN else 0  # на Windows не ми�
 APP_DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "Sortshots"
 
 OLLAMA = "http://127.0.0.1:11434"
-OLLAMA_IGPU = "http://127.0.0.1:11435"  # второй экземпляр на встроенной Intel (Vulkan)
 FAST = os.environ.get("SORTSHOTS_FAST", "qwen3-vl:4b-instruct")
 STRONG = os.environ.get("SORTSHOTS_STRONG", "qwen3-vl:8b-instruct")
 PHONE_DIRS = ["/sdcard/Pictures/Screenshots", "/sdcard/DCIM/Screenshots"]
@@ -408,7 +407,8 @@ def examples_messages(similar, image=True):
 def hints_block():
     """Правила владельца — в сообщении рядом со скриншотом: маленькая модель так слушается их лучше,
     чем в общей инструкции, а сама инструкция не меняется и остаётся в кеше Ollama."""
-    hints = [h for h in load_json(HINTS, []) if h.get("text")]
+    # правила по приложению работают по имени файла, нейросеть его не видит — ей они ни к чему
+    hints = [h for h in load_json(HINTS, []) if h.get("text") and not h.get("app")]
     if not hints:
         return ""
     lines = [f"- {h['text']}" + (f" → тема «{h['topic']}»" if h.get("topic") else "") for h in hints]
@@ -416,28 +416,26 @@ def hints_block():
             "ставь тему из правила.\n" + "\n".join(lines))
 
 
-_rules = (None, [])
-_groups = (None, {})
+_cache = {}
+
+
+def _cached_json(path, default, make=None):
+    """Файл, который читают на каждый скриншот: перечитывается, только если изменился.
+    make — что построить из прочитанного (строится тоже один раз)."""
+    try:
+        st = path.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        stamp = None
+    if _cache.get(path, (0,))[0] != stamp:
+        value = load_json(path, default)
+        _cache[path] = (stamp, make(value) if make else value)
+    return _cache[path][1]
 
 
 def same_screens():
     """{sha: [тема большинства, сколько таких же]} — пересчитывает app после каждой раскладки."""
-    global _groups
-    mtime = GROUPS.stat().st_mtime if GROUPS.exists() else 0
-    if _groups[0] != mtime:
-        _groups = (mtime, load_json(GROUPS, {}))
-    return _groups[1]
-
-
-_cache = {}
-
-
-def _cached_json(path, default):
-    """Файл, который читают на каждый скриншот: перечитывается, только если изменился."""
-    mtime = path.stat().st_mtime if path.exists() else 0
-    if _cache.get(path, (None,))[0] != mtime:
-        _cache[path] = (mtime, load_json(path, default))
-    return _cache[path][1]
+    return _cached_json(GROUPS, {})
 
 
 def labels():
@@ -449,15 +447,10 @@ def learned():
 
 
 def word_rules():
-    """Подсказки с папкой и словами или приложением: [(регулярка или None, тема, слова, приложение)].
-    Перечитываются, только если файл изменился."""
-    global _rules
-    mtime = HINTS.stat().st_mtime if HINTS.exists() else 0
-    if _rules[0] != mtime:
-        _rules = (mtime, [(words_pattern(h.get("words", "")), h["topic"], h.get("words", ""), h.get("app", ""))
-                          for h in load_json(HINTS, [])
-                          if h.get("topic") and (h.get("app") or words_pattern(h.get("words", "")))])
-    return _rules[1]
+    """Подсказки с папкой и словами или приложением: [(регулярка или None, тема, слова, приложение)]."""
+    return _cached_json(HINTS, [], lambda hints: [
+        (words_pattern(h.get("words", "")), h["topic"], h.get("words", ""), h.get("app", ""))
+        for h in hints if h.get("topic") and (h.get("app") or words_pattern(h.get("words", "")))])
 
 
 # Samsung и большинство Android пишут приложение в имя файла: Screenshot_20240402_130343_Calculator Plus.jpg
@@ -569,17 +562,26 @@ def analyze(items, model, stage, topic_list, workers=1):
 # ---------- решение по теме ----------
 
 def final(r, topic_list):
-    ov = load_json(OVERRIDES, {}).get(r["sha"])
+    ov = _cached_json(OVERRIDES, {}).get(r["sha"])
     fast, strong = r.get("fast"), r.get("strong")
+    guess = learned().get(r["sha"])
+    if not (guess and guess[1] >= LEARN_SURE and guess[0] in topic_list):
+        guess = None
     best = strong or fast
     if not best:
-        return None
+        quick = labels().get(r["sha"]) or (guess and guess[0])
+        if not quick:
+            return None
+        # нейросеть до него ещё не дошла, а папка уже известна: лежит там под именем приложения,
+        # название и описание появятся после разбора
+        best = {"topic": quick, "title": app_of(r["src"]) or "Скриншот", "description": "", "keywords": [],
+                "confidence": guess[1] if guess else 1.0}
     # Самооценке маленькой модели верить нельзя (почти всегда 0.95), поэтому главный сигнал —
     # согласие двух моделей. Разошлись — решает человек в «Проверить».
     topic = best["topic"] if best["topic"] in topic_list else CHECK
     if strong and fast and strong["topic"] != fast["topic"]:
         topic = CHECK
-    elif max(x["confidence"] for x in (fast, strong) if x) < 0.7:
+    elif max((x["confidence"] for x in (fast, strong) if x), default=1) < 0.7:
         topic = CHECK
     why = ""
     # Почти одинаковые экраны — туда же, куда большинство таких же (нейросеть иногда кладёт их по-разному)
@@ -587,8 +589,7 @@ def final(r, topic_list):
     if group and group[0] in topic_list and topic != CHECK:
         topic, why = group[0], f"как такие же экраны ({group[1]} шт.)"
     # Классификатор, обученный на разметке и исправлениях владельца: по картинке целиком он точнее нейросети
-    guess = learned().get(r["sha"])
-    if guess and guess[1] >= LEARN_SURE and guess[0] in topic_list:
+    if guess:
         topic, why = guess[0], f"по обучению ({guess[1]:.0%})"
     # Секретное: пароль, код, полный номер карты, паспорт — отдельно, чтобы случайно не переслать
     said_all = " ".join([best.get("title", ""), best.get("description", ""), best.get("seen", "")] + best.get("keywords", []))
@@ -626,8 +627,12 @@ def final(r, topic_list):
 
 def needs_strong(r, topic_list):
     f = r.get("fast")
-    return f and not r.get("strong") and (
-        f["confidence"] < 0.8 or f["topic"].startswith("Разработка/") or f["topic"] not in topic_list)
+    if not f or r.get("strong"):
+        return False
+    guess = learned().get(r["sha"])
+    if guess and guess[1] >= LEARN_SURE:  # папку уже знает классификатор: сильная модель (в 8 раз медленнее)
+        return guess[0].startswith("Разработка/")  # нужна только ради имён и ссылок в «Разработке»
+    return f["confidence"] < 0.8 or f["topic"].startswith("Разработка/") or f["topic"] not in topic_list
 
 
 # ---------- метаданные (без пережатия картинки) ----------
@@ -737,12 +742,11 @@ def load_placed():
 def place(verbose=True):
     topic_list, res = topics(), load_results()
     placed, taken = load_placed(), set()
-    by_src = {p.relative_to(SRC).as_posix(): p for p in sources()}
     rows, ents = [], []
     for sha, r in sorted(res.items(), key=lambda kv: kv[1]["src"]):
-        src = by_src.get(r["src"])
-        info = final(r, topic_list) if src else None
-        if not info:
+        src = SRC / r["src"]
+        info = final(r, topic_list)
+        if not info or not src.exists():
             continue
         base = f"{shot_date(src)} {clean_name(info['title'])}"
         folder = ROOT / info["topic"]
@@ -762,9 +766,11 @@ def place(verbose=True):
                      ", ".join(info["keywords"]), f"{info['confidence']:.2f}", r["src"]])
         ents += [(e, info, rel) for e in info.get("entities", []) if e.get("name")]
     save_json(PLACED, placed)
-    for d in sorted(ROOT.rglob("*"), reverse=True):  # пустые папки от старых тем
-        if d.is_dir() and not d.name.startswith("_") and not any(d.iterdir()):
-            d.rmdir()
+    for top in ROOT.iterdir():  # пустые папки от старых тем (служебные «_…» не обходим: там тысячи файлов)
+        if top.is_dir() and not top.name.startswith("_"):
+            for d, _, _ in os.walk(top, topdown=False):
+                if not os.listdir(d):
+                    os.rmdir(d)
     write_index(rows)
     write_dev(ents)
     if verbose:
@@ -897,17 +903,8 @@ def cmd_sample(a):
     items = index_sources()
     random.seed(1)
     pick = random.sample(items, min(a.n, len(items)))
-    res = []
-    lock = threading.Lock()
-
-    def one(it):
-        r = ask(FAST, it[1], None)
-        with lock:
-            res.append({"src": it[1].name, **r})
-
     print(f"Пробный прогон: {len(pick)} скриншотов")
-    with ThreadPoolExecutor(1) as pool:
-        list(pool.map(one, pick))
+    res = [{"src": p.name, **ask(FAST, p, None)} for _, p in pick]
     save_json(DATA / "sample.json", res)
     for t, n in Counter(r["topic"] for r in res).most_common():
         print(f"{n:4}  {t}")
